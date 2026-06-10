@@ -1,0 +1,7 @@
+iqoptionapi
+pandas
+numpy
+websockets
+python-dotenv
+aiohttp
+requests
