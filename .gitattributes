@@ -1,0 +1,2 @@
+# Shell scripts must use LF line endings so they run on Linux (GCP/VPS)
+*.sh text eol=lf
