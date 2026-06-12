@@ -1,15 +1,18 @@
 """
 Telegram Alert System
-Sends signal alerts and trade results to Telegram channel
+Clean, easy-to-read alerts (Thai): bot on/off, order placement with reasons, trade result summary.
 """
 
 import aiohttp
 import asyncio
+import html
 import logging
 from datetime import datetime
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+_TF_LABEL = {60: "M1", 300: "M5", 900: "M15", 1800: "M30"}
 
 
 @dataclass
@@ -25,98 +28,185 @@ class TelegramBot:
 
     def __init__(self, cfg: TelegramConfig):
         self.cfg = cfg
-        self._sent_signals: set = set()  # dedupe by asset+timestamp
+        self._sent_signals: set = set()
 
     async def send(self, text: str) -> bool:
         if not self.cfg.enabled or not self.cfg.bot_token:
             return False
         url = f"{self.BASE}{self.cfg.bot_token}/sendMessage"
-        payload = {"chat_id": self.cfg.chat_id, "text": text, "parse_mode": "HTML"}
+        payload = {"chat_id": self.cfg.chat_id, "text": text,
+                   "parse_mode": "HTML", "disable_web_page_preview": True}
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
                     ok = r.status == 200
                     if not ok:
-                        logger.warning(f"[TG] HTTP {r.status}")
+                        logger.warning(f"[TG] HTTP {r.status}: {await r.text()}")
                     return ok
         except Exception as e:
             logger.error(f"[TG] Send error: {e}")
             return False
 
-    async def alert_signal(self, signal) -> bool:
-        """Send a signal alert if confidence >= threshold"""
-        if signal.confidence < self.cfg.min_confidence:
-            return False
-        # Dedupe: same asset same minute
-        key = f"{signal.asset}_{signal.timestamp[:16]}"
-        if key in self._sent_signals:
-            return False
-        self._sent_signals.add(key)
+    # ── helpers ──
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().strftime("%H:%M:%S")
 
-        emo = "🚀" if signal.signal == "CALL" else "🔻"
-        bar = _conf_bar(signal.confidence)
-        reasons = "\n".join(f"  ✅ {r}" for r in (signal.reasons or [])[:5])
-        tf_label = {60: "M1", 300: "M5", 900: "M15", 1800: "M30"}.get(signal.timeframe, f"{signal.timeframe}s")
-        risk = "🟢 LOW" if signal.confidence >= 85 else "🟡 MEDIUM"
+    @staticmethod
+    def _src_label(source: str) -> str:
+        return "🤖 Bot" if source == "auto" else "✋ Manual"
 
+    @staticmethod
+    def _dir_label(direction: str) -> str:
+        return "CALL 🟢▲" if direction == "CALL" else ("PUT 🔴▼" if direction == "PUT" else direction)
+
+    @staticmethod
+    def _tf_label(timeframe) -> str:
+        return _TF_LABEL.get(timeframe, f"{timeframe}s")
+
+    # ─────────────────────────────────────────
+    #  1) SYSTEM ON / OFF
+    # ─────────────────────────────────────────
+    async def alert_bot_start(self, *, account_type: str, assets: list, timeframe: int,
+                              trade_amount: float, confidence_threshold: float) -> bool:
+        acc = "🔴 REAL — เงินจริง" if account_type == "REAL" else "🟢 PRACTICE — เงินทดลอง"
         text = (
-            f"{emo} <b>SIGNAL ALERT</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📌 Pair: <b>{signal.asset}</b>\n"
-            f"Direction: <b>{signal.signal}</b>\n"
-            f"Confidence: <b>{signal.confidence:.0f}%</b> {bar}\n"
-            f"Timeframe: <b>{tf_label}</b>\n"
-            f"Entry: <b>{signal.entry_price:.5f}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Indicators:\n{reasons}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"Risk: {risk}\n"
-            f"Expiry: <b>{signal.timeframe // 60} min</b>\n"
-            f"🕐 {datetime.now().strftime('%H:%M:%S')}"
-        )
-        ok = await self.send(text)
-        if ok:
-            logger.info(f"[TG] Alert sent: {signal.asset} {signal.signal} {signal.confidence:.0f}%")
-        return ok
-
-    async def alert_result(self, trade: dict) -> bool:
-        """Send trade result"""
-        emo = "✅" if trade.get("result") == "WIN" else "❌"
-        pnl = trade.get("pnl", 0) or 0
-        text = (
-            f"{emo} <b>TRADE RESULT</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"Pair: <b>{trade['asset']}</b>\n"
-            f"Direction: <b>{trade['direction']}</b>\n"
-            f"Result: <b>{trade.get('result', '?')}</b>\n"
-            f"P&L: <b>{'+' if pnl >= 0 else ''}{pnl:.2f} USD</b>\n"
-            f"Confidence was: {trade.get('confidence', 0):.0f}%\n"
-            f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+            f"🟢 <b>บอทเริ่มทำงานแล้ว</b>\n"
+            f"\n"
+            f"💼 บัญชี: <b>{acc}</b>\n"
+            f"📈 คู่เงิน: <b>{len(assets)} คู่</b>\n"
+            f"⏱ ไทม์เฟรม: <b>{self._tf_label(timeframe)}</b> · หมดอายุ {timeframe // 60} นาที\n"
+            f"💵 เงินต่อไม้: <b>${trade_amount:.0f}</b>\n"
+            f"🎯 เข้าเทรดเมื่อมั่นใจ ≥ <b>{confidence_threshold:.0f}%</b>\n"
+            f"\n"
+            f"🕐 {self._now()}"
         )
         return await self.send(text)
 
+    async def alert_bot_paused(self, today: dict = None) -> bool:
+        text = (
+            f"⏸ <b>หยุดบอทชั่วคราว</b>\n"
+            f"หยุดเปิดออเดอร์ใหม่ (ไม้ที่เปิดอยู่ยังเดินต่อ)\n"
+            f"{self._today_line(today)}"
+            f"\n🕐 {self._now()}"
+        )
+        return await self.send(text)
+
+    async def alert_bot_resumed(self) -> bool:
+        return await self.send(f"▶️ <b>บอทกลับมาเทรดต่อแล้ว</b>\n🕐 {self._now()}")
+
+    @staticmethod
+    def _today_line(today: dict) -> str:
+        if not today:
+            return ""
+        wins, losses = today.get("wins", 0), today.get("losses", 0)
+        pnl = today.get("pnl", 0) or 0
+        sign = "+" if pnl >= 0 else ""
+        return f"📊 วันนี้: {wins}W / {losses}L · {sign}{pnl:.2f} USD\n"
+
+    # ─────────────────────────────────────────
+    #  2) ORDER PLACED (with decision reasons)
+    # ─────────────────────────────────────────
+    async def alert_trade_open(self, trade: dict) -> bool:
+        direction = trade.get("direction", "?")
+        conf = trade.get("confidence")
+        conf_line = (f"🎯 ความมั่นใจ: <b>{conf:.0f}%</b>  {_conf_bar(conf)}\n"
+                     if conf is not None else "")
+
+        # compact indicator glance (auto trades carry these)
+        metrics = []
+        if trade.get("rsi") is not None:
+            metrics.append(f"RSI {trade['rsi']:.0f}")
+        if trade.get("atr") is not None:
+            metrics.append(f"ATR {trade['atr']:.5f}")
+        if trade.get("adx") is not None:
+            metrics.append(f"ADX {trade['adx']:.0f}")
+        metric_line = f"📐 {' · '.join(metrics)}\n" if metrics else ""
+
+        # escape < > & — EMA reasons contain '<'/'>' which break Telegram HTML parse mode
+        reasons = [html.escape(r) for r in (trade.get("reasons") or []) if r][:4]
+        if reasons:
+            reason_block = "📋 <b>เหตุผลที่เข้า:</b>\n" + "\n".join(f"  ✅ {r}" for r in reasons) + "\n"
+        else:
+            reason_block = ""
+
+        mg_line = f"🎲 ไม้ทบ (Martingale): สเต็ป {trade['mg_step']}\n" if trade.get("mg_step") else ""
+
+        text = (
+            f"🚀 <b>ออกออเดอร์ {self._dir_label(direction)}</b>\n"
+            f"\n"
+            f"📌 คู่เงิน: <b>{trade.get('asset', '?')}</b>\n"
+            f"💵 ลงทุน: <b>${trade.get('amount', 0):.0f}</b>\n"
+            f"{mg_line}"
+            f"{conf_line}"
+            f"⏱ หมดอายุ: <b>{trade.get('expiry', '?')} นาที</b>\n"
+            f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
+            f"{metric_line}"
+            f"{reason_block}"
+            f"\n🕐 {self._now()}"
+        )
+        ok = await self.send(text)
+        if ok:
+            logger.info(f"[TG] Order alert: {trade.get('asset')} {direction}")
+        return ok
+
+    # ─────────────────────────────────────────
+    #  3) TRADE RESULT SUMMARY
+    # ─────────────────────────────────────────
+    async def alert_result(self, trade: dict, today: dict = None) -> bool:
+        result = trade.get("result")
+        head = {"WIN": "✅ <b>ผล: ชนะ</b> 🎉",
+                "LOSS": "❌ <b>ผล: แพ้</b>",
+                "EQUAL": "➖ <b>ผล: เสมอ</b> (คืนทุน)"}.get(result, "<b>ผล: ?</b>")
+
+        pnl = trade.get("pnl", 0) or 0
+        amount = trade.get("amount", 0) or 0
+        sign = "+" if pnl >= 0 else ""
+        conf = trade.get("confidence")
+        conf_line = f"🎯 ความมั่นใจ: {conf:.0f}%\n" if conf is not None else ""
+        mg_line = f"🎲 ไม้ทบ: สเต็ป {trade['mg_step']}\n" if trade.get("mg_step") else ""
+
+        summary = self._today_line(today)
+        summary_line = f"\n📈 สรุป{summary[3:]}" if summary else ""
+
+        text = (
+            f"{head}\n"
+            f"\n"
+            f"📌 <b>{trade.get('asset', '?')}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
+            f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
+            f"💵 ลงทุน ${amount:.0f} → <b>{sign}{pnl:.2f} USD</b>\n"
+            f"{mg_line}"
+            f"{conf_line}"
+            f"{summary_line}"
+            f"\n🕐 {self._now()}"
+        )
+        return await self.send(text)
+
+    # ─────────────────────────────────────────
+    #  RISK / LEARNING
+    # ─────────────────────────────────────────
     async def alert_risk_pause(self, reason: str) -> bool:
         text = (
-            f"⚠️ <b>RISK PAUSE</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ <b>หยุดอัตโนมัติ (Risk)</b>\n"
+            f"\n"
             f"{reason}\n"
-            f"Bot has paused trading.\n"
-            f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+            f"บอทหยุดเปิดออเดอร์ใหม่แล้ว\n"
+            f"\n🕐 {self._now()}"
         )
         return await self.send(text)
 
     async def alert_learning(self, result: dict) -> bool:
         if not result.get("disabled_rules") and not result.get("warnings"):
             return False
-        lines = ["🧠 <b>AI LEARNING UPDATE</b>", "━━━━━━━━━━━━━━━━━━"]
+        lines = ["🧠 <b>AI เรียนรู้และปรับกฎ</b>", ""]
         for r in result.get("disabled_rules", []):
-            lines.append(f"🚫 Rule disabled: {r['reason']}")
+            lines.append(f"🚫 ปิดกฎ: {r['reason']}")
         for w in result.get("warnings", []):
             lines.append(f"⚠️ {w}")
-        lines.append(f"🕐 {datetime.now().strftime('%H:%M:%S')}")
+        lines.append(f"\n🕐 {self._now()}")
         return await self.send("\n".join(lines))
 
 
 def _conf_bar(pct: float) -> str:
-    filled = int(pct / 10)
+    filled = max(0, min(10, int(pct / 10)))
     return "█" * filled + "░" * (10 - filled)

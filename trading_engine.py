@@ -17,6 +17,10 @@ from collections import deque
 import pandas as pd
 import numpy as np
 from iqoptionapi.stable_api import IQ_Option
+from iqoptionapi.constants import ACTIVES
+
+# Numeric active_id -> asset name (e.g. 76 -> "EURUSD-OTC"), built once from the static table
+ACTIVE_NAMES = {v: k for k, v in ACTIVES.items()}
 import websockets
 import threading
 from dotenv import load_dotenv
@@ -44,7 +48,7 @@ class TradingConfig:
     # Assets to monitor
     assets: list = None
     timeframe: int = 60          # seconds: 60=M1, 300=M5, 900=M15, 1800=M30
-    candles_history: int = 200   # how many candles to load
+    candles_history: int = 250   # how many candles to load (must be >= ema_trend + 10)
 
     # Signal thresholds
     ema_fast: int = 20
@@ -62,12 +66,32 @@ class TradingConfig:
     volume_period: int = 20
     volume_multiplier: float = 1.2  # Volume must be > avg * multiplier
 
+    # Direction filters (anti-chop / anti-bias)
+    adx_min: float = 22.0        # below this = no real trend -> HOLD (don't trade sideways)
+    dir_margin: float = 15.0     # dominant side must beat the other by this many directional points
+
     # Trade settings
-    trade_amount: float = 1.0    # USD per trade
-    expiry_minutes: int = 5
-    max_trades_per_hour: int = 6
-    max_consecutive_losses: int = 3
+    trade_amount: float = 50.0   # base stake per trade (account currency)
+    expiry_minutes: int = 10     # binary, ~2 x M5 candles
+    max_trades_per_hour: int = 12
+    max_consecutive_losses: int = 4
     confidence_threshold: float = 70.0  # min score to trade
+
+    # Martingale money management (applies to BOT/auto trades only)
+    martingale_enabled: bool = True
+    martingale_base: float = 50.0       # step 1 stake
+    martingale_multiplier: float = 2.0  # each loss multiplies the next stake
+    martingale_max_steps: int = 4       # 50 -> 100 -> 200 -> 400, then reset
+
+    # Risk limits (dashboard counters)
+    max_open_positions: int = 3   # up to 3 concurrent auto trades (independent Martingale lanes)
+    max_trades_per_day: int = 20
+    daily_profit_target: float = 200.0
+    daily_loss_limit: float = 0.0   # 0 = disabled
+
+    # Asset discovery
+    auto_discover_assets: bool = False  # scan all open binary/turbo forex pairs
+    max_assets: int = 12                # cap when auto-discovering
 
     def __post_init__(self):
         if self.assets is None:
@@ -193,133 +217,127 @@ class SignalEngine:
         row = df.iloc[-1]
         prev = df.iloc[-2]
 
-        call_score = 0
-        put_score = 0
+        # Directional points only (max 65): these decide CALL vs PUT.
+        # ATR / Volume / ADX are NOT scored to a side — they are quality gates below,
+        # so "confidence" reflects directional edge, not just market activity.
+        MAX_DIR = 65
+        call = 0
+        put = 0
         call_reasons = []
         put_reasons = []
         breakdown_call = {}
         breakdown_put = {}
 
-        # ── EMA TREND ALIGNMENT (25 pts) ──
+        # ── EMA TREND ALIGNMENT (25 / partial 10) ──
         ema_bull = row["ema_fast"] > row["ema_slow"] > row["ema_trend"]
         ema_bear = row["ema_fast"] < row["ema_slow"] < row["ema_trend"]
         if ema_bull:
-            call_score += 25; breakdown_call["ema_alignment"] = 25
-            call_reasons.append(f"EMA bull stack: {row['ema_fast']:.5f} > {row['ema_slow']:.5f} > {row['ema_trend']:.5f}")
+            call += 25; breakdown_call["ema_alignment"] = 25
+            call_reasons.append(f"EMA เรียงขาขึ้น {row['ema_fast']:.5f} > {row['ema_slow']:.5f} > {row['ema_trend']:.5f}")
+        elif row["ema_fast"] > row["ema_slow"]:
+            call += 10; breakdown_call["ema_partial"] = 10
+            call_reasons.append("EMA fast > slow (ขาขึ้นบางส่วน)")
         if ema_bear:
-            put_score += 25; breakdown_put["ema_alignment"] = 25
-            put_reasons.append(f"EMA bear stack: {row['ema_fast']:.5f} < {row['ema_slow']:.5f} < {row['ema_trend']:.5f}")
+            put += 25; breakdown_put["ema_alignment"] = 25
+            put_reasons.append(f"EMA เรียงขาลง {row['ema_fast']:.5f} < {row['ema_slow']:.5f} < {row['ema_trend']:.5f}")
+        elif row["ema_fast"] < row["ema_slow"]:
+            put += 10; breakdown_put["ema_partial"] = 10
+            put_reasons.append("EMA fast < slow (ขาลงบางส่วน)")
 
-        # Partial EMA (10 pts if fast > slow only)
-        if not ema_bull and row["ema_fast"] > row["ema_slow"]:
-            call_score += 10; breakdown_call["ema_partial"] = 10
-            call_reasons.append("EMA fast > slow (partial bullish)")
-        if not ema_bear and row["ema_fast"] < row["ema_slow"]:
-            put_score += 10; breakdown_put["ema_partial"] = 10
-            put_reasons.append("EMA fast < slow (partial bearish)")
-
-        # ── RSI (20 pts) ──
+        # ── RSI (20 / extreme reversal 10) ──
         rsi = row["rsi"]
         if self.cfg.rsi_call_min <= rsi <= self.cfg.rsi_call_max:
-            call_score += 20; breakdown_call["rsi"] = 20
-            call_reasons.append(f"RSI {rsi:.1f} in bullish zone [{self.cfg.rsi_call_min}-{self.cfg.rsi_call_max}]")
+            call += 20; breakdown_call["rsi"] = 20
+            call_reasons.append(f"RSI {rsi:.1f} โซนกระทิง [{self.cfg.rsi_call_min:.0f}-{self.cfg.rsi_call_max:.0f}]")
         elif self.cfg.rsi_put_min <= rsi <= self.cfg.rsi_put_max:
-            put_score += 20; breakdown_put["rsi"] = 20
-            put_reasons.append(f"RSI {rsi:.1f} in bearish zone [{self.cfg.rsi_put_min}-{self.cfg.rsi_put_max}]")
+            put += 20; breakdown_put["rsi"] = 20
+            put_reasons.append(f"RSI {rsi:.1f} โซนหมี [{self.cfg.rsi_put_min:.0f}-{self.cfg.rsi_put_max:.0f}]")
         elif rsi > self.cfg.rsi_overbought:
-            put_score += 10; breakdown_put["rsi_extreme"] = 10
-            put_reasons.append(f"RSI {rsi:.1f} overbought — reversal bias")
+            put += 10; breakdown_put["rsi_extreme"] = 10
+            put_reasons.append(f"RSI {rsi:.1f} overbought — ลุ้นกลับตัวลง")
         elif rsi < self.cfg.rsi_oversold:
-            call_score += 10; breakdown_call["rsi_extreme"] = 10
-            call_reasons.append(f"RSI {rsi:.1f} oversold — bounce bias")
+            call += 10; breakdown_call["rsi_extreme"] = 10
+            call_reasons.append(f"RSI {rsi:.1f} oversold — ลุ้นเด้งขึ้น")
 
-        # ── ATR VOLATILITY FILTER (15 pts) ──
+        # ── MACD (15) ──
+        macd_hist = row["macd_hist"]
+        prev_macd = prev["macd_hist"]
+        if macd_hist > 0 and macd_hist > prev_macd:
+            call += 15; breakdown_call["macd"] = 15
+            call_reasons.append(f"MACD histogram เป็นบวกและเพิ่มขึ้น {macd_hist:.5f}")
+        if macd_hist < 0 and macd_hist < prev_macd:
+            put += 15; breakdown_put["macd"] = 15
+            put_reasons.append(f"MACD histogram เป็นลบและลดลง {macd_hist:.5f}")
+
+        # ── BOLLINGER (5) — only count when it agrees with the EMA trend (no counter-trend knife) ──
+        price = row["close"]
+        if price < row["bb_lower"] * 1.001 and row["ema_fast"] >= row["ema_slow"]:
+            call += 5; breakdown_call["bollinger"] = 5
+            call_reasons.append("ราคาแตะ BB ล่างในแนวโน้มขึ้น — ลุ้นเด้ง")
+        if price > row["bb_upper"] * 0.999 and row["ema_fast"] <= row["ema_slow"]:
+            put += 5; breakdown_put["bollinger"] = 5
+            put_reasons.append("ราคาแตะ BB บนในแนวโน้มลง — ลุ้นย่อ")
+
+        # ── QUALITY GATES (not scored to a side) ──
         atr = row["atr"]
         atr_avg = row["atr_avg"] if not pd.isna(row["atr_avg"]) else atr
         atr_high = atr > atr_avg * self.cfg.atr_multiplier
-        if atr_high:
-            call_score += 15; put_score += 15
-            breakdown_call["atr"] = 15; breakdown_put["atr"] = 15
-            call_reasons.append(f"ATR {atr:.5f} above avg ({atr_avg:.5f}) — good volatility")
-            put_reasons.append(f"ATR {atr:.5f} above avg — good volatility")
-        else:
-            call_reasons.append(f"ATR {atr:.5f} low volatility — caution")
-            put_reasons.append(f"ATR {atr:.5f} low volatility — caution")
-
-        # ── MACD (15 pts) ──
-        macd_hist = row["macd_hist"]
-        prev_macd = prev["macd_hist"]
-        macd_bull = macd_hist > 0 and macd_hist > prev_macd
-        macd_bear = macd_hist < 0 and macd_hist < prev_macd
-        if macd_bull:
-            call_score += 15; breakdown_call["macd"] = 15
-            call_reasons.append(f"MACD histogram bullish {macd_hist:.5f}")
-        if macd_bear:
-            put_score += 15; breakdown_put["macd"] = 15
-            put_reasons.append(f"MACD histogram bearish {macd_hist:.5f}")
-
-        # ── VOLUME CONFIRMATION (10 pts) ──
         vol = row["volume"]
         vol_avg = row["volume_avg"] if not pd.isna(row["volume_avg"]) else vol
-        if vol > vol_avg * self.cfg.volume_multiplier:
-            call_score += 10; put_score += 10
-            breakdown_call["volume"] = 10; breakdown_put["volume"] = 10
-            call_reasons.append(f"Volume {vol:.0f} above avg ({vol_avg:.0f}) — confirmed")
-            put_reasons.append(f"Volume above avg — confirmed")
-
-        # ── ADX TREND STRENGTH (10 pts) ──
+        vol_high = vol > vol_avg * self.cfg.volume_multiplier
         adx = row["adx"]
-        if adx > 25:
-            call_score += 10; put_score += 10
-            breakdown_call["adx"] = 10; breakdown_put["adx"] = 10
-            call_reasons.append(f"ADX {adx:.1f} — strong trend")
-            put_reasons.append(f"ADX {adx:.1f} — strong trend")
-        else:
-            call_reasons.append(f"ADX {adx:.1f} — weak trend, caution")
-            put_reasons.append(f"ADX {adx:.1f} — weak trend, caution")
-
-        # ── BOLLINGER BAND CONTEXT (5 pts) ──
-        price = row["close"]
-        if price < row["bb_lower"] * 1.001:
-            call_score += 5; breakdown_call["bollinger"] = 5
-            call_reasons.append("Price near BB lower — potential bounce")
-        if price > row["bb_upper"] * 0.999:
-            put_score += 5; breakdown_put["bollinger"] = 5
-            put_reasons.append("Price near BB upper — potential rejection")
+        adx_ok = adx >= self.cfg.adx_min
 
         # ── DECISION ──
-        if call_score >= put_score and call_score >= self.cfg.confidence_threshold:
-            return SignalResult(
-                asset=asset, timeframe=self.cfg.timeframe,
-                signal="CALL", confidence=min(call_score, 100),
-                score_breakdown=breakdown_call, reasons=call_reasons,
-                entry_price=price, rsi=rsi, atr=atr,
-                ema_fast=row["ema_fast"], ema_slow=row["ema_slow"],
-                ema_trend=row["ema_trend"], adx=adx, macd_hist=macd_hist,
-                timestamp=datetime.now().isoformat()
-            )
-        elif put_score > call_score and put_score >= self.cfg.confidence_threshold:
-            return SignalResult(
-                asset=asset, timeframe=self.cfg.timeframe,
-                signal="PUT", confidence=min(put_score, 100),
-                score_breakdown=breakdown_put, reasons=put_reasons,
-                entry_price=price, rsi=rsi, atr=atr,
-                ema_fast=row["ema_fast"], ema_slow=row["ema_slow"],
-                ema_trend=row["ema_trend"], adx=adx, macd_hist=macd_hist,
-                timestamp=datetime.now().isoformat()
-            )
+        # 1) need a clear directional winner (no CALL-on-tie bias)
+        if call > put:
+            side, dom, reasons, breakdown = "CALL", call, call_reasons, breakdown_call
+        elif put > call:
+            side, dom, reasons, breakdown = "PUT", put, put_reasons, breakdown_put
         else:
-            max_score = max(call_score, put_score)
-            reasons = call_reasons if call_score >= put_score else put_reasons
-            return SignalResult(
-                asset=asset, timeframe=self.cfg.timeframe,
-                signal="HOLD", confidence=max_score,
-                score_breakdown={}, reasons=reasons[:3],
-                entry_price=price, rsi=rsi, atr=atr,
-                ema_fast=row["ema_fast"], ema_slow=row["ema_slow"],
-                ema_trend=row["ema_trend"], adx=adx, macd_hist=macd_hist,
-                timestamp=datetime.now().isoformat()
-            )
+            return self._hold(asset, row, rsi, atr, adx, macd_hist, "สองทิศคะแนนเท่ากัน — ไม่เทรด")
+
+        confidence = round(dom / MAX_DIR * 100, 1)   # directional edge, 0-100
+        margin = dom - min(call, put)
+        side_label = side
+
+        # 2) hard filters — any failure => HOLD
+        gates = []
+        if not adx_ok:
+            gates.append(f"ADX {adx:.1f} < {self.cfg.adx_min:.0f} (ตลาดออกข้าง)")
+        if margin < self.cfg.dir_margin:
+            gates.append(f"ทิศไม่ชัด (นำแค่ {margin} แต้ม)")
+        if confidence < self.cfg.confidence_threshold:
+            gates.append(f"confidence {confidence:.0f}% < {self.cfg.confidence_threshold:.0f}%")
+        if gates:
+            return self._hold(asset, row, rsi, atr, adx, macd_hist,
+                              reasons[:2] + [f"⛔ {side_label} ถูกกรอง: " + " · ".join(gates)], confidence)
+
+        # passed — annotate quality
+        if adx_ok: reasons.append(f"ADX {adx:.1f} — เทรนด์แข็งแรง")
+        if atr_high: reasons.append("ATR สูงกว่าค่าเฉลี่ย — ความผันผวนพอเหมาะ")
+        if vol_high: reasons.append("Volume สูงกว่าค่าเฉลี่ย — ยืนยันแรงซื้อขาย")
+
+        return SignalResult(
+            asset=asset, timeframe=self.cfg.timeframe,
+            signal=side, confidence=min(confidence, 100),
+            score_breakdown=breakdown, reasons=reasons,
+            entry_price=price, rsi=rsi, atr=atr,
+            ema_fast=row["ema_fast"], ema_slow=row["ema_slow"],
+            ema_trend=row["ema_trend"], adx=adx, macd_hist=macd_hist,
+            timestamp=datetime.now().isoformat()
+        )
+
+    def _hold(self, asset, row, rsi, atr, adx, macd_hist, reasons, confidence=0) -> SignalResult:
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        return SignalResult(
+            asset=asset, timeframe=self.cfg.timeframe, signal="HOLD", confidence=confidence,
+            score_breakdown={}, reasons=reasons[:4], entry_price=row["close"],
+            rsi=rsi, atr=atr, ema_fast=row["ema_fast"], ema_slow=row["ema_slow"],
+            ema_trend=row["ema_trend"], adx=adx, macd_hist=macd_hist,
+            timestamp=datetime.now().isoformat()
+        )
 
     def _no_signal(self, asset, reason):
         return SignalResult(
@@ -339,11 +357,22 @@ class TradeManager:
     def __init__(self, cfg: TradingConfig, iq: IQ_Option):
         self.cfg = cfg
         self.iq = iq
-        self.trades = []          # list of trade dicts
-        self.active_orders = {}   # order_id -> trade_info
+        self.trades = self._load_trades()   # list of trade dicts (persisted across restarts)
+        self.active_orders = {t["id"]: t for t in self.trades if t.get("status") == "open" and t.get("id")}
         self.consecutive_losses = 0
         self.hourly_trades = deque()
         self.learning_rules = self._load_learning_rules()
+        self._lock = threading.RLock()  # guards trades/active_orders across the trading & sync threads
+        # Per-asset Martingale ladder: each pair recovers its own losses independently,
+        # so up to max_open_positions pairs can run concurrent ladders.
+        self.asset_step = {}  # asset -> 0-indexed current step (0 = base stake)
+
+    def _load_trades(self) -> list:
+        try:
+            with open("data/trades.json") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
 
     def _load_learning_rules(self) -> list:
         try:
@@ -351,6 +380,51 @@ class TradeManager:
                 return json.load(f)
         except FileNotFoundError:
             return []
+
+    def today_trades(self) -> list:
+        today = datetime.now().date().isoformat()
+        return [t for t in self.trades if str(t.get("open_time", ""))[:10] == today]
+
+    def today_pnl(self) -> float:
+        return round(sum(t.get("pnl") or 0 for t in self.today_trades() if t.get("status") == "closed"), 2)
+
+    # ── Martingale (BOT/auto trades only) ──
+    def martingale_sequence(self) -> list:
+        base, mult, steps = self.cfg.martingale_base, self.cfg.martingale_multiplier, self.cfg.martingale_max_steps
+        return [round(base * (mult ** i), 2) for i in range(steps)]
+
+    def next_auto_stake(self, asset: str) -> float:
+        """Stake for the next bot trade on this asset: base when Martingale is off,
+        else this asset's current ladder step."""
+        if not self.cfg.martingale_enabled:
+            return self.cfg.trade_amount
+        seq = self.martingale_sequence()
+        step = min(self.asset_step.get(asset, 0), len(seq) - 1)
+        return seq[step]
+
+    def _advance_martingale(self, asset: str, result: str):
+        """After a BOT trade closes: climb that asset's ladder on loss, reset on win.
+        Reaching the final step then losing resets to base (accept the drawdown)."""
+        if not self.cfg.martingale_enabled:
+            return
+        step = self.asset_step.get(asset, 0)
+        if result == "LOSS":
+            step += 1
+            if step >= self.cfg.martingale_max_steps:
+                logger.warning(f"[MARTINGALE] {asset}: final step lost — reset ladder to base")
+                step = 0
+            self.asset_step[asset] = step
+        elif result == "WIN":
+            if step:
+                logger.info(f"[MARTINGALE] {asset}: win — reset ladder to base")
+            self.asset_step[asset] = 0
+        # EQUAL: keep the same step (stake returned, no progression)
+
+    def open_auto_count(self) -> int:
+        return sum(1 for t in self.active_orders.values() if t.get("source") == "auto")
+
+    def open_auto_assets(self) -> set:
+        return {t.get("asset") for t in self.active_orders.values() if t.get("source") == "auto"}
 
     def can_trade(self) -> tuple[bool, str]:
         now = time.time()
@@ -361,6 +435,12 @@ class TradeManager:
             return False, f"Max {self.cfg.max_trades_per_hour} trades/hour reached"
         if self.consecutive_losses >= self.cfg.max_consecutive_losses:
             return False, f"Consecutive losses {self.consecutive_losses} — cooling down"
+        if len(self.active_orders) >= self.cfg.max_open_positions:
+            return False, f"Max {self.cfg.max_open_positions} open positions reached"
+        if len(self.today_trades()) >= self.cfg.max_trades_per_day:
+            return False, f"Max {self.cfg.max_trades_per_day} trades/day reached"
+        if self.cfg.daily_loss_limit > 0 and -self.today_pnl() >= self.cfg.daily_loss_limit:
+            return False, f"Daily loss limit {self.cfg.daily_loss_limit} reached"
         return True, "OK"
 
     def apply_learning_veto(self, signal: SignalResult) -> tuple[bool, str]:
@@ -383,10 +463,48 @@ class TradeManager:
             return True, f"Vetoed by learning rule: {rule.get('reason', 'unknown')}"
         return False, ""
 
-    def execute_trade(self, signal: SignalResult) -> Optional[dict]:
+    def _place_order(self, asset: str, direction: str, amount: float, meta: dict) -> Optional[dict]:
+        """Place a binary order on IQ Option and record it. direction: CALL/PUT"""
+        d = "call" if direction.upper() == "CALL" else "put"
+        logger.info(f"[TRADE] Placing {d.upper()} on {asset} | amount {amount} | source {meta.get('source')}")
+        try:
+            check, order_id = self.iq.buy(amount, asset, d, self.cfg.expiry_minutes)
+            if not check:
+                logger.error(f"[TRADE] Order failed for {asset} (broker rejected: {order_id})")
+                return None
+          # fall through to record under lock
+        except Exception as e:
+            logger.error(f"[TRADE] Exception: {e}")
+            return None
+
+        with self._lock:
+            trade = {
+                "id": order_id,
+                "asset": asset,
+                "direction": direction.upper(),
+                "amount": amount,
+                "open_time": datetime.now().isoformat(),
+                "expiry": self.cfg.expiry_minutes,
+                "status": "open",
+                "pnl": None,
+                "result": None,
+                **meta,
+            }
+            self.active_orders[order_id] = trade
+            self.trades.append(trade)
+            self.hourly_trades.append(time.time())
+            self._save_trades()
+            logger.info(f"[TRADE] Order placed: ID {order_id}")
+            return trade
+
+    def execute_trade(self, signal: SignalResult, source: str = "auto") -> Optional[dict]:
         can, reason = self.can_trade()
         if not can:
             logger.warning(f"[RISK] Trade blocked: {reason}")
+            return None
+
+        # One open auto trade per asset at a time (each asset = its own Martingale lane)
+        if signal.asset in self.open_auto_assets():
             return None
 
         vetoed, veto_reason = self.apply_learning_veto(signal)
@@ -394,93 +512,232 @@ class TradeManager:
             logger.warning(f"[LEARNING] {veto_reason}")
             return None
 
-        direction = "call" if signal.signal == "CALL" else "put"
-        asset_fmt = signal.asset  # IQ Option format
+        step = self.asset_step.get(signal.asset, 0)
+        stake = self.next_auto_stake(signal.asset)
+        step_info = (f" | {signal.asset} Martingale step {step + 1}/{self.cfg.martingale_max_steps}"
+                     if self.cfg.martingale_enabled else "")
+        logger.info(f"[TRADE] Auto stake {stake}{step_info}")
+        return self._place_order(signal.asset, signal.signal, stake, {
+            "entry": signal.entry_price,
+            "confidence": signal.confidence,
+            "reasons": signal.reasons,
+            "rsi": signal.rsi,
+            "atr": signal.atr,
+            "adx": signal.adx,
+            "source": source,
+            "mg_step": (step + 1) if self.cfg.martingale_enabled else None,
+        })
 
-        logger.info(f"[TRADE] Placing {direction.upper()} on {asset_fmt} @ {signal.entry_price} | Confidence: {signal.confidence:.1f}%")
-
-        try:
-            check, order_id = self.iq.buy(
-                self.cfg.trade_amount,
-                asset_fmt,
-                direction,
-                self.cfg.expiry_minutes
-            )
-            if check:
-                trade = {
-                    "id": order_id,
-                    "asset": signal.asset,
-                    "direction": signal.signal,
-                    "amount": self.cfg.trade_amount,
-                    "entry": signal.entry_price,
-                    "confidence": signal.confidence,
-                    "reasons": signal.reasons,
-                    "rsi": signal.rsi,
-                    "atr": signal.atr,
-                    "adx": signal.adx,
-                    "open_time": datetime.now().isoformat(),
-                    "expiry": self.cfg.expiry_minutes,
-                    "status": "open",
-                    "pnl": None,
-                    "result": None
-                }
-                self.active_orders[order_id] = trade
-                self.trades.append(trade)
-                self.hourly_trades.append(time.time())
-                self._save_trades()
-                logger.info(f"[TRADE] Order placed: ID {order_id}")
-                return trade
-            else:
-                logger.error(f"[TRADE] Order failed for {asset_fmt}")
-                return None
-        except Exception as e:
-            logger.error(f"[TRADE] Exception: {e}")
+    def execute_manual(self, asset: str, direction: str, amount: float = None) -> Optional[dict]:
+        """Manual trade from dashboard — bypasses signal confidence but respects open-position cap"""
+        if direction.upper() not in ("CALL", "PUT"):
+            logger.warning(f"[TRADE] Invalid manual direction: {direction}")
             return None
+        if len(self.active_orders) >= self.cfg.max_open_positions:
+            logger.warning(f"[RISK] Manual trade blocked: max {self.cfg.max_open_positions} open positions")
+            return None
+        return self._place_order(asset, direction, amount or self.cfg.trade_amount, {
+            "entry": 0,
+            "confidence": None,
+            "reasons": ["manual trade from dashboard"],
+            "source": "manual",
+        })
+
+    def _fetch_closed_positions(self) -> dict:
+        """Closed option positions from the portfolio history, keyed by order id (external_id)."""
+        by_id = {}
+        instrument_types = {"turbo-option"}
+        if any((t.get("expiry") or self.cfg.expiry_minutes) > 5 for t in self.active_orders.values()):
+            instrument_types.add("binary-option")
+        for itype in instrument_types:
+            try:
+                check, msg = self.iq.get_position_history_v2(itype, 50, 0, 0, 0)
+                if not check:
+                    continue
+                for p in (msg or {}).get("positions", []):
+                    ext = p.get("external_id")
+                    if ext is not None:
+                        by_id[str(ext)] = p
+            except Exception as e:
+                logger.warning(f"[RESULT] position history ({itype}) failed: {e}")
+        return by_id
 
     def check_results(self):
-        """Poll IQ Option for results of active orders"""
-        closed = []
-        for order_id, trade in list(self.active_orders.items()):
-            try:
-                result = self.iq.check_win_v3(order_id)
-                if result is not None:
-                    win_amount = float(result)
-                    pnl = win_amount - self.cfg.trade_amount if win_amount > 0 else -self.cfg.trade_amount
-                    trade["pnl"] = round(pnl, 2)
-                    trade["result"] = "WIN" if win_amount > 0 else "LOSS"
-                    trade["close_time"] = datetime.now().isoformat()
-                    trade["status"] = "closed"
+        """Poll IQ Option for results of active orders via portfolio position history.
+        (The library's check_win_v3 / get_optioninfo_v2 rely on a deprecated endpoint
+        that the server no longer answers, so they block forever.)"""
+        # Only bother once at least one order is past its expiry
+        now = datetime.now()
+        with self._lock:
+            due = []
+            for order_id, trade in self.active_orders.items():
+                try:
+                    opened = datetime.fromisoformat(str(trade["open_time"]))
+                except ValueError:
+                    due.append(order_id)
+                    continue
+                if now >= opened + timedelta(minutes=trade.get("expiry") or self.cfg.expiry_minutes, seconds=10):
+                    due.append(order_id)
+        if not due:
+            return
 
-                    if trade["result"] == "LOSS":
-                        self.consecutive_losses += 1
-                    else:
-                        self.consecutive_losses = 0
+        by_id = self._fetch_closed_positions()  # network — kept outside the lock
 
-                    logger.info(f"[RESULT] {trade['asset']} {trade['direction']} → {trade['result']} | PnL: {pnl:+.2f}")
-                    closed.append(order_id)
-                    self._save_trades()
-            except Exception as e:
-                logger.debug(f"Order {order_id} still pending: {e}")
+        with self._lock:
+            closed = []
+            for order_id in due:
+                trade = self.active_orders.get(order_id)
+                if not trade:
+                    continue  # closed by the sync loop meanwhile
+                p = by_id.get(str(order_id))
+                if not p or p.get("status") != "closed":
+                    continue  # not in closed history yet — try next cycle
+                self._apply_close(trade, p.get("close_reason"), p.get("pnl_net", p.get("pnl")))
+                closed.append(order_id)
 
-        for oid in closed:
-            del self.active_orders[oid]
+            if closed:
+                self._save_trades()
+            for oid in closed:
+                self.active_orders.pop(oid, None)
 
-    def get_stats(self) -> dict:
-        closed = [t for t in self.trades if t["status"] == "closed"]
-        if not closed:
-            return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0, "pnl": 0}
-        wins = [t for t in closed if t["result"] == "WIN"]
-        losses = [t for t in closed if t["result"] == "LOSS"]
+    def _apply_close(self, trade: dict, close_reason: str, pnl_raw) -> None:
+        """Mark a trade closed from a 'win'/'loose'/'equal' reason + raw pnl value."""
+        try:
+            pnl = round(float(pnl_raw or 0), 2)
+        except (TypeError, ValueError):
+            pnl = 0.0
+        trade["pnl"] = pnl
+        trade["result"] = "WIN" if close_reason == "win" else ("EQUAL" if close_reason == "equal" else "LOSS")
+        trade["close_time"] = datetime.now().isoformat()
+        trade["status"] = "closed"
+        # Risk counter + Martingale ladder track BOT trades only (manual/web don't affect them)
+        if trade.get("source") == "auto":
+            if trade["result"] == "LOSS":
+                self.consecutive_losses += 1
+            elif trade["result"] == "WIN":
+                self.consecutive_losses = 0
+            self._advance_martingale(trade["asset"], trade["result"])
+        logger.info(f"[RESULT] {trade['asset']} {trade['direction']} -> {trade['result']} | PnL: {pnl:+.2f}")
+
+    def sync_external_trades(self) -> list:
+        """Discover option trades opened directly on the IQ Option website/app from the
+        realtime portfolio buffer (api.order_async) and merge them into our trade list
+        with source='web'. Also refreshes live status of trades we already track.
+        Returns the list of newly discovered trades."""
+        try:
+            order_async = dict(self.iq.api.order_async)
+        except Exception:
+            return []
+
+        added = []
+        with self._lock:
+            by_id = {str(t.get("id")): t for t in self.trades if t.get("id")}
+            for raw_oid, events in order_async.items():
+                pc = events.get("position-changed") if isinstance(events, dict) else None
+                if not pc:
+                    continue
+                msg = pc.get("msg", {}) or {}
+                if msg.get("instrument_type") not in ("turbo-option", "binary-option"):
+                    continue
+                raw = msg.get("raw_event", {}) or {}
+                ext = msg.get("external_id") or raw_oid
+                is_closed = msg.get("status") == "closed"
+
+                existing = by_id.get(str(ext))
+                if existing:
+                    # finalize a trade we already track if the platform shows it closed
+                    if existing.get("status") == "open" and is_closed:
+                        self._apply_close(existing, msg.get("close_reason"), msg.get("pnl_net", msg.get("pnl")))
+                        self.active_orders.pop(ext, None)
+                        self._save_trades()
+                    continue
+
+                # New trade opened outside the bot
+                asset = ACTIVE_NAMES.get(msg.get("active_id"), str(msg.get("active_id")))
+                direction = (raw.get("direction") or "").upper()
+                amount = float(msg.get("invest") or raw.get("amount") or 0)
+                open_ms = msg.get("open_time") or raw.get("open_time_millisecond")
+                try:
+                    open_time = datetime.fromtimestamp(open_ms / 1000).isoformat() if open_ms else datetime.now().isoformat()
+                except (TypeError, ValueError, OSError):
+                    open_time = datetime.now().isoformat()
+                exp_sec = raw.get("expiration_time")
+                expiry_min = self.cfg.expiry_minutes
+                if exp_sec and open_ms:
+                    expiry_min = max(1, round((exp_sec - open_ms / 1000) / 60))
+
+                trade = {
+                    "id": ext,
+                    "asset": asset,
+                    "direction": direction if direction in ("CALL", "PUT") else (direction or "?"),
+                    "amount": round(amount, 2),
+                    "open_time": open_time,
+                    "expiry": expiry_min,
+                    "status": "open",
+                    "pnl": None,
+                    "result": None,
+                    "entry": 0,
+                    "confidence": None,
+                    "reasons": ["opened on IQ Option platform"],
+                    "source": "web",
+                }
+                if is_closed:
+                    self._apply_close(trade, msg.get("close_reason"), msg.get("pnl_net", msg.get("pnl")))
+                else:
+                    self.active_orders[ext] = trade
+                self.trades.append(trade)
+                by_id[str(ext)] = trade
+                added.append(trade)
+                logger.info(f"[SYNC] External trade {asset} {direction} ${amount:.2f} (id {ext}) status={trade['status']}")
+
+            if added:
+                self._save_trades()
+        return added
+
+    @staticmethod
+    def _stat_block(closed: list) -> dict:
+        wins = sum(1 for t in closed if t["result"] == "WIN")
+        losses = sum(1 for t in closed if t["result"] == "LOSS")
+        equals = sum(1 for t in closed if t["result"] == "EQUAL")
+        decided = wins + losses
         pnl = sum(t["pnl"] for t in closed if t["pnl"] is not None)
         return {
             "total": len(closed),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": round(len(wins) / len(closed) * 100, 1),
+            "wins": wins,
+            "losses": losses,
+            "equals": equals,
+            "win_rate": round(wins / decided * 100, 1) if decided else 0,
             "pnl": round(pnl, 2),
-            "consecutive_losses": self.consecutive_losses,
-            "active_orders": len(self.active_orders)
         }
+
+    @staticmethod
+    def _is_bot(t: dict) -> bool:
+        return t.get("source") == "auto"
+
+    def _stats_by_source(self, closed: list) -> dict:
+        """Overall stat block + Bot/Manual split (manual = dashboard manual + web/app trades)."""
+        block = self._stat_block(closed)
+        block["bot"] = self._stat_block([t for t in closed if self._is_bot(t)])
+        block["manual"] = self._stat_block([t for t in closed if not self._is_bot(t)])
+        return block
+
+    def get_stats(self) -> dict:
+        closed = [t for t in self.trades if t["status"] == "closed"]
+        today_closed = [t for t in self.today_trades() if t["status"] == "closed"]
+        stats = self._stats_by_source(closed)
+        stats["today"] = self._stats_by_source(today_closed)
+        stats["consecutive_losses"] = self.consecutive_losses
+        stats["active_orders"] = len(self.active_orders)
+        stats["martingale"] = {
+            "enabled": self.cfg.martingale_enabled,
+            "max_steps": self.cfg.martingale_max_steps,
+            "sequence": self.martingale_sequence(),
+            "base": self.cfg.martingale_base,
+            "max_lanes": self.cfg.max_open_positions,
+            # assets currently mid-recovery (step > 0): asset -> step number (1-indexed)
+            "active": {a: s + 1 for a, s in self.asset_step.items() if s > 0},
+        }
+        return stats
 
     def _save_trades(self):
         os.makedirs("data", exist_ok=True)
@@ -494,7 +751,7 @@ class TradeManager:
 class LearningEngine:
     """Analyze trade history and generate/disable rules"""
 
-    MIN_SAMPLE = 15  # minimum trades before learning kicks in
+    MIN_SAMPLE = 8  # minimum trades before learning kicks in
 
     def analyze(self, trades: list) -> dict:
         closed = [t for t in trades if t.get("status") == "closed"]
@@ -580,7 +837,12 @@ state_store = {
     "balance": 0,
     "status": "stopped",
     "learning": {},
-    "candles": {}
+    "candles": {},
+    "risk": {},
+    "config": {},
+    "account_type": "PRACTICE",
+    "activity": {},        # current one-line heartbeat: what the bot is doing right now
+    "activity_log": [],    # rolling timeline of activity + per-pair decisions
 }
 
 
@@ -624,6 +886,7 @@ class TradingBot:
         self.trade_manager: Optional[TradeManager] = None
         self.running = False
         self.loop_count = 0
+        self._assets_resolved = False  # True once we have a confirmed tradable (OTC) asset list
 
     def connect(self) -> bool:
         logger.info(f"[IQ] Connecting as {self.cfg.email} ({self.cfg.account_type})")
@@ -633,9 +896,122 @@ class TradingBot:
             self.iq.change_balance(self.cfg.account_type)
             logger.info(f"[IQ] Connected. Balance: {self.iq.get_balance():.2f}")
             self.trade_manager = TradeManager(self.cfg, self.iq)
+            # Asset resolution happens in the first run_cycle (non-blocking) so a slow/degraded
+            # IQ market-list endpoint can't stall startup or the dashboard balance.
             return True
         logger.error(f"[IQ] Connection failed: {reason}")
         return False
+
+    def resolve_assets(self):
+        """Pick tradable assets from the markets currently open for binary/turbo options.
+        Fixed list mode: swap each configured asset for its open variant (EURUSD -> EURUSD-OTC).
+        Auto mode (IQ_ASSETS=AUTO): discover every open forex pair, capped at cfg.max_assets."""
+        open_time = None
+        for attempt in range(3):
+            try:
+                ot = self.iq.get_all_open_time()
+                if ot and (ot.get("turbo") or ot.get("binary")):
+                    open_time = ot
+                    break
+            except Exception as e:
+                logger.warning(f"[ASSET] get_all_open_time attempt {attempt + 1} failed: {e}")
+            time.sleep(1.5)
+
+        # Fallback: the market-list endpoint is flaky/degraded — probe OTC pairs directly.
+        # get_candles still works even when get_all_open_time hangs, so a pair that returns
+        # candles is tradable right now.
+        if not open_time:
+            logger.warning("[ASSET] open-markets endpoint unavailable — probing OTC pairs via candles")
+            resolved = self._probe_otc_fallback()
+            if resolved:
+                if resolved != self.cfg.assets:
+                    logger.info(f"[ASSET] Tradable assets now: {', '.join(resolved)}")
+                self.cfg.assets = resolved
+                self._assets_resolved = True
+            else:
+                logger.warning("[ASSET] probe found no tradable OTC pairs — keeping current list")
+            return
+
+        def is_open(kind, name):
+            return bool(open_time.get(kind, {}).get(name, {}).get("open"))
+
+        # Real forex pairs only — both halves must be major currency codes
+        # (filters out AMAZON, COFFEE, BCHUSD and other 6-letter actives)
+        majors = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
+        priority = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
+                    "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY"]
+
+        def is_fx_pair(name):
+            base = name.replace("-OTC", "")
+            return len(base) == 6 and base[:3] in majors and base[3:] in majors
+
+        def rank(name):
+            base = name.replace("-OTC", "")
+            return (priority.index(base) if base in priority else len(priority), base)
+
+        resolved = []
+        if self.cfg.auto_discover_assets:
+            # turbo first (supports 1-5 min expiry), then binary; de-dup base pairs preferring non-OTC
+            seen_base = {}
+            for kind in ("turbo", "binary"):
+                for name, info in open_time.get(kind, {}).items():
+                    if not info.get("open") or not is_fx_pair(name):
+                        continue
+                    base = name.replace("-OTC", "")
+                    if base not in seen_base or (seen_base[base].endswith("-OTC") and not name.endswith("-OTC")):
+                        seen_base[base] = name
+            resolved = sorted(seen_base.values(), key=rank)[: self.cfg.max_assets]
+        else:
+            for asset in self.cfg.assets:
+                base = asset.replace("-OTC", "")
+                for candidate in (base, base + "-OTC"):
+                    if is_open("turbo", candidate) or is_open("binary", candidate):
+                        resolved.append(candidate)
+                        break
+                else:
+                    logger.warning(f"[ASSET] {base}: closed for binary/turbo right now — skipped")
+
+        # Top up with other open major pairs when configured ones are closed
+        MAJORS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "EURGBP",
+                  "EURJPY", "GBPJPY", "USDCHF", "NZDUSD", "AUDJPY"]
+        want = 5
+        for base in MAJORS:
+            if len(resolved) >= want:
+                break
+            if any(r.replace("-OTC", "") == base for r in resolved):
+                continue
+            for candidate in (base, base + "-OTC"):
+                if is_open("turbo", candidate) or is_open("binary", candidate):
+                    resolved.append(candidate)
+                    logger.info(f"[ASSET] Added {candidate} to fill scan list")
+                    break
+
+        if resolved:
+            if resolved != self.cfg.assets:
+                logger.info(f"[ASSET] Tradable assets now: {', '.join(resolved)}")
+            self.cfg.assets = resolved
+            # Consider resolution confirmed once we actually have OTC (binary-tradable) pairs
+            self._assets_resolved = any(a.endswith("-OTC") for a in resolved) or not self.cfg.auto_discover_assets
+        else:
+            logger.warning("[ASSET] No tradable assets found — keeping current list")
+
+    def _probe_otc_fallback(self) -> list:
+        """When the open-markets endpoint is down, find tradable OTC pairs by trying to
+        fetch a few candles for each default major. Pairs that return data are tradable now."""
+        candidates = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC",
+                      "USDCAD-OTC", "USDCHF-OTC", "NZDUSD-OTC", "EURGBP-OTC",
+                      "EURJPY-OTC", "GBPJPY-OTC", "AUDJPY-OTC", "CADJPY-OTC"]
+        tradable = []
+        for name in candidates:
+            if len(tradable) >= self.cfg.max_assets:
+                break
+            try:
+                candles = self.iq.get_candles(name, self.cfg.timeframe, 5, time.time())
+                if candles:
+                    tradable.append(name)
+            except Exception:
+                continue
+        return tradable
 
     def get_candles(self, asset: str) -> Optional[pd.DataFrame]:
         try:
@@ -645,6 +1021,10 @@ class TradingBot:
             df = pd.DataFrame(candles)
             df = df.rename(columns={"open": "open", "close": "close", "max": "high", "min": "low", "volume": "volume"})
             df = df[["open", "high", "low", "close", "volume"]].astype(float)
+            # Drop the last candle — it's the current still-forming one. We decide only on
+            # the most recent CLOSED candle (so entries happen on confirmed data, not mid-candle).
+            if len(df) > 1:
+                df = df.iloc[:-1].reset_index(drop=True)
             return df
         except Exception as e:
             logger.error(f"[CANDLE] {asset}: {e}")
