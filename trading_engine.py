@@ -26,11 +26,21 @@ import threading
 from dotenv import load_dotenv
 
 load_dotenv()
+# Ensure runtime dirs exist before logging is configured (fresh clones have no logs/ data/),
+# and use UTF-8 so Thai text + emoji don't crash the handlers on any platform.
+os.makedirs("logs", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+try:
+    import sys as _sys
+    _sys.stdout.reconfigure(encoding="utf-8")
+    _sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("logs/trading.log"),
+        logging.FileHandler("logs/trading.log", encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
