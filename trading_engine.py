@@ -912,6 +912,26 @@ class TradingBot:
         logger.error(f"[IQ] Connection failed: {reason}")
         return False
 
+    def ensure_connected(self) -> bool:
+        """True if the IQ socket is alive; otherwise try to reconnect once.
+        Without this the loop stalls forever if IQ drops the connection."""
+        try:
+            if self.iq and self.iq.check_connect():
+                return True
+        except Exception:
+            pass
+        logger.warning("[IQ] Connection lost — reconnecting...")
+        try:
+            check, reason = self.iq.connect()
+            if check:
+                self.iq.change_balance(self.cfg.account_type)
+                logger.info("[IQ] Reconnected successfully")
+                return True
+            logger.error(f"[IQ] Reconnect failed: {reason}")
+        except Exception as e:
+            logger.error(f"[IQ] Reconnect error: {e}")
+        return False
+
     def resolve_assets(self):
         """Pick tradable assets from the markets currently open for binary/turbo options.
         Fixed list mode: swap each configured asset for its open variant (EURUSD -> EURUSD-OTC).

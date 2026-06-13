@@ -149,6 +149,22 @@ class FullTradingBot(TradingBot):
         self.loop_count += 1
         signals_this_cycle = []
 
+        # Make sure the IQ socket is alive — reconnect if it dropped (otherwise the loop stalls)
+        try:
+            connected = await asyncio.wait_for(asyncio.to_thread(self.ensure_connected), timeout=45)
+        except Exception:
+            connected = False
+        if not connected:
+            self.log_activity("⚠️", "IQ หลุดการเชื่อมต่อ — กำลังต่อใหม่ จะลองอีกครั้งรอบถัดไป", level="error", phase="connecting")
+            state_store["status"] = "reconnecting"
+            self._need_resolve = True
+            await broadcast({"type": "update", "data": {
+                "status": "reconnecting",
+                "activity": state_store["activity"],
+                "activity_log": state_store["activity_log"],
+            }})
+            return
+
         # Resolve tradable assets: keep retrying until we have OTC pairs, then hourly / on demand
         if not self._assets_resolved or self.loop_count % 12 == 1 or getattr(self, "_need_resolve", False):
             try:
