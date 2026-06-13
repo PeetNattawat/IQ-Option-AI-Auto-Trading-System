@@ -1,4 +1,5 @@
-iqoptionapi
+# iqoptionapi must come from GitHub — the PyPI package of the same name lacks stable_api
+iqoptionapi @ git+https://github.com/iqoptionapi/iqoptionapi.git
 pandas
 numpy
 websockets
