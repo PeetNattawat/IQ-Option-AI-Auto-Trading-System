@@ -82,7 +82,7 @@ class TradingConfig:
 
     # Trade settings
     trade_amount: float = 50.0   # base stake per trade (account currency)
-    expiry_minutes: int = 10     # binary, ~2 x M5 candles
+    expiry_minutes: int = 15     # binary — snaps to the next :00/:15/:30/:45 quarter-hour
     max_trades_per_hour: int = 12
     max_consecutive_losses: int = 4
     confidence_threshold: float = 70.0  # min score to trade
