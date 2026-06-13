@@ -47,6 +47,26 @@ class TelegramBot:
             logger.error(f"[TG] Send error: {e}")
             return False
 
+    async def get_updates(self, offset=None, timeout: int = 25) -> list:
+        """Long-poll Telegram for incoming commands. Returns the raw 'result' list."""
+        if not self.cfg.enabled or not self.cfg.bot_token:
+            return []
+        url = f"{self.BASE}{self.cfg.bot_token}/getUpdates"
+        params = {"timeout": timeout, "allowed_updates": '["message"]'}
+        if offset is not None:
+            params["offset"] = offset
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=timeout + 10)) as r:
+                    if r.status != 200:
+                        return []
+                    data = await r.json()
+            return data.get("result", []) or []
+        except Exception as e:
+            logger.debug(f"[TG] getUpdates error: {e}")
+            return []
+
     # ── helpers ──
     @staticmethod
     def _now() -> str:

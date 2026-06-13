@@ -426,6 +426,106 @@ class FullTradingBot(TradingBot):
         state_store["config"] = self.build_config()
         await broadcast({"type": "update", "data": {"config": state_store["config"]}})
 
+    # ── Telegram remote control ──
+    def _tg_summary_text(self) -> str:
+        tm = self.trade_manager
+        if not tm:
+            return "ยังไม่ได้เชื่อมต่อ"
+        t = tm.get_stats().get("today", {})
+        pnl = t.get("pnl", 0) or 0
+        sign = "+" if pnl >= 0 else ""
+        bot, man = t.get("bot", {}), t.get("manual", {})
+        return (
+            f"📊 <b>สรุปวันนี้</b>\n\n"
+            f"💰 กำไร/ขาดทุน: <b>{sign}{pnl:.2f}</b>\n"
+            f"📈 เทรด: <b>{t.get('total', 0)}</b> ไม้ "
+            f"(ชนะ {t.get('wins', 0)} / แพ้ {t.get('losses', 0)} / เสมอ {t.get('equals', 0)})\n"
+            f"🎯 winrate: <b>{t.get('win_rate', 0)}%</b>\n"
+            f"🤖 Bot: {bot.get('wins',0)}W/{bot.get('losses',0)}L · "
+            f"✋ Manual: {man.get('wins',0)}W/{man.get('losses',0)}L\n"
+            f"💵 balance: <b>{state_store.get('balance', 0):,.2f}</b>\n"
+            f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        )
+
+    def _tg_status_text(self) -> str:
+        r = self.build_risk()
+        act = (state_store.get("activity") or {}).get("msg", "-")
+        status = "หยุดอยู่ (paused)" if self._paused else state_store.get("status", "-")
+        return (
+            f"🤖 <b>สถานะบอท</b>\n\n"
+            f"สถานะ: <b>{status}</b>\n"
+            f"บัญชี: <b>{self.cfg.account_type}</b>\n"
+            f"💵 balance: <b>{state_store.get('balance', 0):,.2f}</b>\n"
+            f"ไม้เปิดอยู่: {r.get('open',0)}/{r.get('max_open',3)} · "
+            f"เทรดวันนี้: {r.get('today_trades',0)}\n"
+            f"กำไรวันนี้: {r.get('daily_pnl',0):+.2f}\n"
+            f"กำลัง: {act}\n"
+            f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+        )
+
+    async def handle_telegram_command(self, text: str):
+        cmd = text.lstrip("/").split()[0].split("@")[0].lower()
+        logger.info(f"[TG-CMD] received: /{cmd}")
+        if cmd in ("start", "run", "resume", "go"):
+            await self.handle_command("start")
+            await self.tg.send("▶️ <b>เริ่มบอทแล้ว</b> — กลับไปสแกนหาสัญญาณ")
+        elif cmd in ("stop", "pause"):
+            await self.handle_command("stop")
+            await self.tg.send("⏸ <b>หยุดบอทแล้ว</b> — ไม่เปิดออเดอร์ใหม่ (ไม้ที่เปิดอยู่ยังเดินต่อ)")
+        elif cmd == "restart":
+            await self.tg.send("🔄 <b>กำลังรีสตาร์ทบอท...</b> จะกลับมาออนไลน์ใน ~15 วินาที")
+            logger.warning("[TG-CMD] restart requested — exiting (systemd will relaunch)")
+            await asyncio.sleep(1)
+            os._exit(0)   # systemd Restart=always brings it back
+        elif cmd in ("status", "stat", "s"):
+            await self.tg.send(self._tg_status_text())
+        elif cmd in ("summary", "pnl", "today", "sum"):
+            await self.tg.send(self._tg_summary_text())
+        else:
+            await self.tg.send(
+                "📋 <b>คำสั่งที่ใช้ได้</b>\n"
+                "/start — เริ่ม/เล่นต่อ\n"
+                "/stop — หยุดชั่วคราว\n"
+                "/restart — รีสตาร์ทบอท\n"
+                "/status — ดูสถานะตอนนี้\n"
+                "/summary — สรุปกำไรวันนี้"
+            )
+
+    async def telegram_command_loop(self):
+        """Listen for Telegram commands (long-poll). Only the configured chat may control."""
+        if not self.tg.cfg.enabled or not self.tg.cfg.bot_token:
+            return
+        allowed = str(self.tg.cfg.chat_id)
+        # Skip any backlog so old messages don't trigger actions on startup
+        offset = None
+        try:
+            backlog = await self.tg.get_updates(timeout=0)
+            if backlog:
+                offset = backlog[-1]["update_id"] + 1
+        except Exception:
+            pass
+        await self.tg.send("🎮 พร้อมรับคำสั่ง: /start /stop /restart /status /summary")
+        while True:
+            try:
+                updates = await self.tg.get_updates(offset=offset, timeout=25)
+            except Exception as e:
+                logger.debug(f"[TG-CMD] poll error: {e}")
+                await asyncio.sleep(5)
+                continue
+            for u in updates:
+                offset = u["update_id"] + 1
+                msg = u.get("message") or {}
+                chat = str((msg.get("chat") or {}).get("id", ""))
+                txt = (msg.get("text") or "").strip()
+                if allowed and chat != allowed:
+                    logger.warning(f"[TG-CMD] ignored command from unauthorized chat {chat}")
+                    continue
+                if txt.startswith("/"):
+                    try:
+                        await self.handle_telegram_command(txt)
+                    except Exception as e:
+                        logger.error(f"[TG-CMD] handler error: {e}")
+
     async def external_sync_loop(self, interval: int = 15):
         """Every ~15s keep the dashboard live: refresh balance, finalize closed trades,
         pull in platform-opened trades, and broadcast a fresh snapshot — independent of
@@ -629,6 +729,7 @@ async def main():
         ws_server_full(),
         bot.main_loop(),
         bot.external_sync_loop(),
+        bot.telegram_command_loop(),
     )
 
 
