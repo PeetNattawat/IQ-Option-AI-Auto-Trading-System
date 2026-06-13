@@ -102,6 +102,8 @@ class TradingConfig:
     # Asset discovery
     auto_discover_assets: bool = False  # scan all open binary/turbo forex pairs
     max_assets: int = 12                # cap when auto-discovering
+    trade_otc: bool = False             # NEVER trade OTC (synthetic) pairs — real forex only
+    min_payout: float = 0.70            # only trade pairs paying at least this (e.g. 0.70 = 70%)
 
     def __post_init__(self):
         if self.assets is None:
@@ -933,9 +935,9 @@ class TradingBot:
         return False
 
     def resolve_assets(self):
-        """Pick tradable assets from the markets currently open for binary/turbo options.
-        Fixed list mode: swap each configured asset for its open variant (EURUSD -> EURUSD-OTC).
-        Auto mode (IQ_ASSETS=AUTO): discover every open forex pair, capped at cfg.max_assets."""
+        """Pick the most attractive REAL (non-OTC) forex pairs that are open for binary,
+        ranked by payout (highest first). OTC pairs are never traded.
+        Real forex only trades on weekdays, so this returns [] on weekends → bot waits."""
         open_time = None
         for attempt in range(3):
             try:
@@ -946,102 +948,54 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"[ASSET] get_all_open_time attempt {attempt + 1} failed: {e}")
             time.sleep(1.5)
-
-        # Fallback: the market-list endpoint is flaky/degraded — probe OTC pairs directly.
-        # get_candles still works even when get_all_open_time hangs, so a pair that returns
-        # candles is tradable right now.
         if not open_time:
-            logger.warning("[ASSET] open-markets endpoint unavailable — probing OTC pairs via candles")
-            resolved = self._probe_otc_fallback()
-            if resolved:
-                if resolved != self.cfg.assets:
-                    logger.info(f"[ASSET] Tradable assets now: {', '.join(resolved)}")
-                self.cfg.assets = resolved
-                self._assets_resolved = True
-            else:
-                logger.warning("[ASSET] probe found no tradable OTC pairs — keeping current list")
+            logger.warning("[ASSET] open-markets endpoint unavailable — will retry next cycle")
             return
 
-        def is_open(kind, name):
-            return bool(open_time.get(kind, {}).get(name, {}).get("open"))
-
-        # Real forex pairs only — both halves must be major currency codes
-        # (filters out AMAZON, COFFEE, BCHUSD and other 6-letter actives)
         majors = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
-        priority = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF",
-                    "NZDUSD", "EURGBP", "EURJPY", "GBPJPY", "AUDJPY", "CADJPY"]
 
-        def is_fx_pair(name):
-            base = name.replace("-OTC", "")
-            return len(base) == 6 and base[:3] in majors and base[3:] in majors
+        def is_real_fx(name):
+            if name.endswith("-OTC"):          # never trade OTC (synthetic) pairs
+                return False
+            return len(name) == 6 and name[:3] in majors and name[3:] in majors
 
-        def rank(name):
-            base = name.replace("-OTC", "")
-            return (priority.index(base) if base in priority else len(priority), base)
+        # All real forex pairs currently open for binary or turbo
+        open_pairs = set()
+        for kind in ("binary", "turbo"):
+            for name, info in open_time.get(kind, {}).items():
+                if info.get("open") and is_real_fx(name):
+                    open_pairs.add(name)
 
-        resolved = []
-        if self.cfg.auto_discover_assets:
-            # turbo first (supports 1-5 min expiry), then binary; de-dup base pairs preferring non-OTC
-            seen_base = {}
-            for kind in ("turbo", "binary"):
-                for name, info in open_time.get(kind, {}).items():
-                    if not info.get("open") or not is_fx_pair(name):
-                        continue
-                    base = name.replace("-OTC", "")
-                    if base not in seen_base or (seen_base[base].endswith("-OTC") and not name.endswith("-OTC")):
-                        seen_base[base] = name
-            resolved = sorted(seen_base.values(), key=rank)[: self.cfg.max_assets]
+        if not open_pairs:
+            if self.cfg.assets:
+                logger.info("[ASSET] No real forex pairs open (market closed/weekend) — waiting, OTC disabled")
+            self.cfg.assets = []
+            self._assets_resolved = False
+            return
+
+        # Rank by payout — we trade 15-min binary, so use binary payout (fall back to turbo)
+        try:
+            profits = self.iq.get_all_profit()
+        except Exception as e:
+            logger.warning(f"[ASSET] get_all_profit failed: {e} — selecting without payout ranking")
+            profits = {}
+
+        def payout(name):
+            p = profits.get(name, {}) if profits else {}
+            return float(p.get("binary") or p.get("turbo") or 0)
+
+        ranked = sorted(open_pairs, key=payout, reverse=True)
+        if profits:
+            filtered = [a for a in ranked if payout(a) >= self.cfg.min_payout]
+            chosen = (filtered or ranked)[: self.cfg.max_assets]
         else:
-            for asset in self.cfg.assets:
-                base = asset.replace("-OTC", "")
-                for candidate in (base, base + "-OTC"):
-                    if is_open("turbo", candidate) or is_open("binary", candidate):
-                        resolved.append(candidate)
-                        break
-                else:
-                    logger.warning(f"[ASSET] {base}: closed for binary/turbo right now — skipped")
+            chosen = ranked[: self.cfg.max_assets]
 
-        # Top up with other open major pairs when configured ones are closed
-        MAJORS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "EURGBP",
-                  "EURJPY", "GBPJPY", "USDCHF", "NZDUSD", "AUDJPY"]
-        want = 5
-        for base in MAJORS:
-            if len(resolved) >= want:
-                break
-            if any(r.replace("-OTC", "") == base for r in resolved):
-                continue
-            for candidate in (base, base + "-OTC"):
-                if is_open("turbo", candidate) or is_open("binary", candidate):
-                    resolved.append(candidate)
-                    logger.info(f"[ASSET] Added {candidate} to fill scan list")
-                    break
-
-        if resolved:
-            if resolved != self.cfg.assets:
-                logger.info(f"[ASSET] Tradable assets now: {', '.join(resolved)}")
-            self.cfg.assets = resolved
-            # Consider resolution confirmed once we actually have OTC (binary-tradable) pairs
-            self._assets_resolved = any(a.endswith("-OTC") for a in resolved) or not self.cfg.auto_discover_assets
-        else:
-            logger.warning("[ASSET] No tradable assets found — keeping current list")
-
-    def _probe_otc_fallback(self) -> list:
-        """When the open-markets endpoint is down, find tradable OTC pairs by trying to
-        fetch a few candles for each default major. Pairs that return data are tradable now."""
-        candidates = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC",
-                      "USDCAD-OTC", "USDCHF-OTC", "NZDUSD-OTC", "EURGBP-OTC",
-                      "EURJPY-OTC", "GBPJPY-OTC", "AUDJPY-OTC", "CADJPY-OTC"]
-        tradable = []
-        for name in candidates:
-            if len(tradable) >= self.cfg.max_assets:
-                break
-            try:
-                candles = self.iq.get_candles(name, self.cfg.timeframe, 5, time.time())
-                if candles:
-                    tradable.append(name)
-            except Exception:
-                continue
-        return tradable
+        if chosen != self.cfg.assets:
+            label = ", ".join(f"{a} {payout(a)*100:.0f}%" for a in chosen) if profits else ", ".join(chosen)
+            logger.info(f"[ASSET] Tradable (by payout): {label}")
+        self.cfg.assets = chosen
+        self._assets_resolved = True
 
     def get_candles(self, asset: str) -> Optional[pd.DataFrame]:
         try:

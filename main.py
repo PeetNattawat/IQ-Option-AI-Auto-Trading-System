@@ -165,15 +165,26 @@ class FullTradingBot(TradingBot):
             }})
             return
 
-        # Resolve tradable assets: keep retrying until we have OTC pairs, then hourly / on demand
+        # Resolve tradable real-forex pairs (ranked by payout). Re-check until we have some,
+        # then hourly / on demand.
         if not self._assets_resolved or self.loop_count % 12 == 1 or getattr(self, "_need_resolve", False):
             try:
                 await asyncio.wait_for(asyncio.to_thread(self.resolve_assets), timeout=60)
                 self._need_resolve = False
             except Exception as e:
                 logger.warning(f"[ASSET] resolve failed: {e}")
-            if not self._assets_resolved:
-                self.log_activity("⚠️", "ดึงรายชื่อคู่เงิน OTC จาก IQ ยังไม่ได้ — กำลังลองใหม่ (อาจเป็นที่เซิร์ฟเวอร์ IQ)", level="warn", phase="connecting")
+
+        # No real forex pairs open (weekend / outside market hours) — wait, never trade OTC
+        if not self.cfg.assets:
+            self.log_activity("💤", "ตลาดคู่เงินจริงปิดอยู่ (สุดสัปดาห์/นอกเวลาทำการ) — รอตลาดเปิด · ไม่เทรด OTC", phase="waiting")
+            state_store.update({"status": "running", "signals": [],
+                                "risk": self.build_risk(), "stats": self.trade_manager.get_stats()})
+            await broadcast({"type": "update", "data": {
+                "status": "running", "signals": [], "risk": state_store["risk"],
+                "stats": state_store["stats"], "balance": state_store["balance"],
+                "activity": state_store["activity"], "activity_log": state_store["activity_log"],
+            }})
+            return
 
         self.log_activity("🔍", f"กำลังสแกน {len(self.cfg.assets)} คู่ (รอบที่ {self.loop_count})", phase="scanning")
 
