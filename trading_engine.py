@@ -936,21 +936,24 @@ class TradingBot:
 
     def resolve_assets(self):
         """Pick the most attractive REAL (non-OTC) forex pairs that are open for binary,
-        ranked by payout (highest first). OTC pairs are never traded.
-        Real forex only trades on weekdays, so this returns [] on weekends → bot waits."""
+        ranked by payout (highest first). OTC pairs are never traded."""
         open_time = None
         for attempt in range(3):
             try:
                 ot = self.iq.get_all_open_time()
-                if ot and (ot.get("turbo") or ot.get("binary")):
+                if ot is not None:  # accept even if sections are empty dicts
                     open_time = ot
                     break
             except Exception as e:
                 logger.warning(f"[ASSET] get_all_open_time attempt {attempt + 1} failed: {e}")
             time.sleep(1.5)
-        if not open_time:
+        if open_time is None:
             logger.warning("[ASSET] open-markets endpoint unavailable — will retry next cycle")
             return
+
+        top_keys = list(open_time.keys())
+        counts = {k: len(open_time.get(k, {})) for k in top_keys}
+        logger.info(f"[ASSET] get_all_open_time keys: {top_keys} | counts: {counts}")
 
         majors = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
 
@@ -959,16 +962,20 @@ class TradingBot:
                 return False
             return len(name) == 6 and name[:3] in majors and name[3:] in majors
 
-        # All real forex pairs currently open for binary or turbo
+        # Collect all real forex pairs marked open across binary / turbo / digital
         open_pairs = set()
-        for kind in ("binary", "turbo"):
-            for name, info in open_time.get(kind, {}).items():
-                if info.get("open") and is_real_fx(name):
+        for kind in ("binary", "turbo", "digital"):
+            section = open_time.get(kind) or {}
+            for name, info in section.items():
+                is_open = info.get("open") if isinstance(info, dict) else bool(info)
+                if is_open and is_real_fx(name):
                     open_pairs.add(name)
+
+        logger.info(f"[ASSET] Real forex pairs currently open: {sorted(open_pairs) or 'none'}")
 
         if not open_pairs:
             if self.cfg.assets:
-                logger.info("[ASSET] No real forex pairs open (market closed/weekend) — waiting, OTC disabled")
+                logger.info("[ASSET] No real forex pairs open — waiting (OTC disabled)")
             self.cfg.assets = []
             self._assets_resolved = False
             return
