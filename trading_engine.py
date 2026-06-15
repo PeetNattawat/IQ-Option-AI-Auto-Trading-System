@@ -100,14 +100,17 @@ class TradingConfig:
     daily_loss_limit: float = 0.0   # 0 = disabled
 
     # Asset discovery
-    auto_discover_assets: bool = False  # scan all open binary/turbo forex pairs
+    auto_discover_assets: bool = False  # scan all open forex pairs (binary/turbo/digital)
     max_assets: int = 12                # cap when auto-discovering
     trade_otc: bool = False             # NEVER trade OTC (synthetic) pairs — real forex only
+    trade_digital: bool = True          # also scan/trade DIGITAL options — real forex usually lives here
     min_payout: float = 0.70            # only trade pairs paying at least this (e.g. 0.70 = 70%)
 
     def __post_init__(self):
         if self.assets is None:
             self.assets = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "EURGBP"]
+        # name -> instrument kind ("digital" | "binary" | "turbo"), filled by resolve_assets
+        self.asset_kind = {}
 
 
 # ─────────────────────────────────────────
@@ -496,13 +499,20 @@ class TradeManager:
         return False, ""
 
     def _place_order(self, asset: str, direction: str, amount: float, meta: dict) -> Optional[dict]:
-        """Place a binary order on IQ Option and record it. direction: CALL/PUT"""
-        d = "call" if direction.upper() == "CALL" else "put"
-        logger.info(f"[TRADE] Placing {d.upper()} on {asset} | amount {amount} | source {meta.get('source')}")
+        """Place an order on IQ Option and record it. direction: CALL/PUT.
+        Routes to digital-spot for assets resolved as 'digital' (real forex usually trades
+        only on digital), otherwise to the binary endpoint."""
+        kind = (getattr(self.cfg, "asset_kind", None) or {}).get(asset, "binary")
+        action = "call" if direction.upper() == "CALL" else "put"
+        duration = self.cfg.expiry_minutes
+        logger.info(f"[TRADE] Placing {action.upper()} on {asset} [{kind}] | amount {amount} | source {meta.get('source')}")
         try:
-            check, order_id = self.iq.buy(amount, asset, d, self.cfg.expiry_minutes)
+            if kind == "digital":
+                check, order_id = self.iq.buy_digital_spot(asset, amount, action, duration)
+            else:
+                check, order_id = self.iq.buy(amount, asset, action, duration)
             if not check:
-                logger.error(f"[TRADE] Order failed for {asset} (broker rejected: {order_id})")
+                logger.error(f"[TRADE] Order failed for {asset} [{kind}] (broker rejected: {order_id})")
                 return None
           # fall through to record under lock
         except Exception as e:
@@ -513,10 +523,11 @@ class TradeManager:
             trade = {
                 "id": order_id,
                 "asset": asset,
+                "kind": kind,
                 "direction": direction.upper(),
                 "amount": amount,
                 "open_time": datetime.now().isoformat(),
-                "expiry": self.cfg.expiry_minutes,
+                "expiry": duration,
                 "status": "open",
                 "pnl": None,
                 "result": None,
@@ -581,6 +592,8 @@ class TradeManager:
         instrument_types = {"turbo-option"}
         if any((t.get("expiry") or self.cfg.expiry_minutes) > 5 for t in self.active_orders.values()):
             instrument_types.add("binary-option")
+        if any(t.get("kind") == "digital" for t in self.active_orders.values()):
+            instrument_types.add("digital-option")
         for itype in instrument_types:
             try:
                 check, msg = self.iq.get_position_history_v2(itype, 50, 0, 0, 0)
@@ -669,7 +682,7 @@ class TradeManager:
                 if not pc:
                     continue
                 msg = pc.get("msg", {}) or {}
-                if msg.get("instrument_type") not in ("turbo-option", "binary-option"):
+                if msg.get("instrument_type") not in ("turbo-option", "binary-option", "digital-option"):
                     continue
                 raw = msg.get("raw_event", {}) or {}
                 ext = msg.get("external_id") or raw_oid
@@ -955,10 +968,29 @@ class TradingBot:
         return False
 
     def resolve_assets(self):
-        """Pick open REAL (non-OTC) forex pairs for binary/turbo, ranked by payout.
-        Reads the live instrument list (get_all_init_v2): each active carries its id,
-        name (front.XXX / front.XXX-OTC) and suspended flag — authoritative, and works
-        for brand-new active_ids the static library table doesn't know about."""
+        """Pick open REAL (non-OTC) forex pairs across binary / turbo / DIGITAL, ranked by payout.
+
+        On current IQ Option, real forex is usually open only as *digital* options while
+        binary/turbo carry mostly OTC — so scanning binary/turbo alone finds nothing real.
+        We therefore also read the digital underlying list (authoritative open windows via
+        each pair's `schedule`). OTC is never selected (policy: real forex only)."""
+
+        def is_fx(name):
+            # real (non-OTC) forex. IQ names the REAL binary/turbo option "XXXXXX-op",
+            # the OTC (synthetic) one "XXXXXX-OTC", and older listings are bare 6-letter.
+            # Strip a trailing "-op" before checking the 6-letter currency pair.
+            if name.endswith("-OTC"):              # never trade OTC (synthetic) pairs
+                return False
+            base = name[:-3] if name.endswith("-op") else name
+            return len(base) == 6 and base[:3].isalpha() and base[3:].isalpha()
+
+        open_kind = {}        # name -> "digital" | "binary" | "turbo"  (digital preferred for real FX)
+        name_by_id = {}       # active_id -> name (for readable alert names)
+        digital_open = []
+        otc_count = 0
+        repatched = 0
+
+        # ── 1) binary/turbo via init_v2 (also re-patches the stale name->id table) ──
         init = None
         for attempt in range(3):
             try:
@@ -969,83 +1001,123 @@ class TradingBot:
             except Exception as e:
                 logger.warning(f"[ASSET] get_all_init_v2 attempt {attempt + 1} failed: {e}")
             time.sleep(1.5)
-        if not init:
-            logger.warning("[ASSET] instrument list unavailable — will retry next cycle")
-            return
 
-        majors = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
+        if init:
+            for option in ("binary", "turbo"):
+                actives = (init.get(option) or {}).get("actives") or {}
+                for aid, active in actives.items():
+                    clean = str(active.get("name", "")).split(".")[-1]
+                    if not clean:
+                        continue
+                    try:
+                        aid_key = int(aid)
+                    except (TypeError, ValueError):
+                        continue
+                    name_by_id[aid_key] = clean
+                    # Patch name->id with the LIVE id (static table goes stale, e.g.
+                    # GBPNZD 947 -> 1880); otherwise get_candles()/buy() hit a dead id.
+                    if ACTIVES.get(clean) != aid_key:
+                        ACTIVES[clean] = aid_key
+                        repatched += 1
+                    is_open = active.get("enabled", True) and not active.get("is_suspended", False)
+                    if not is_open:
+                        continue
+                    if clean.endswith("-OTC"):
+                        otc_count += 1
+                    elif is_fx(clean):
+                        open_kind.setdefault(clean, option)
+        else:
+            logger.warning("[ASSET] init_v2 unavailable — relying on digital list this cycle")
 
-        def is_real_fx(name):
-            if name.endswith("-OTC"):          # never trade OTC (synthetic) pairs
-                return False
-            return len(name) == 6 and name[:3] in majors and name[3:] in majors
+        # ── 2) digital underlyings (where real forex actually trades) ──
+        if self.cfg.trade_digital:
+            try:
+                # The first call only subscribes; the list arrives async and a slow link can
+                # miss the library's 30s wait. Retry — a follow-up call usually returns at once.
+                dl = None
+                for attempt in range(3):
+                    dl = self.iq.get_digital_underlying_list_data()
+                    if dl and dl.get("underlying"):
+                        break
+                    logger.warning(f"[ASSET] digital list attempt {attempt + 1} empty — retrying")
+                    time.sleep(2)
+                underlying = (dl or {}).get("underlying") or []
+                now = time.time()
+                for d in underlying:
+                    name = str(d.get("underlying") or "")
+                    if not name:
+                        continue
+                    aid = d.get("active_id")
+                    if isinstance(aid, int):
+                        name_by_id[aid] = name
+                        if ACTIVES.get(name) != aid:
+                            ACTIVES[name] = aid
+                            repatched += 1
+                    is_open = any(s.get("open", 0) < now < s.get("close", 0)
+                                  for s in (d.get("schedule") or []))
+                    if not is_open:
+                        continue
+                    if name.endswith("-OTC"):
+                        otc_count += 1
+                    elif is_fx(name):
+                        open_kind[name] = "digital"   # digital wins over binary/turbo for real FX
+                        digital_open.append(name)
+            except Exception as e:
+                logger.warning(f"[ASSET] digital underlying list failed: {e}")
 
-        open_real, open_otc, name_by_id = set(), set(), {}
-        repatched = 0
-        for option in ("binary", "turbo"):
-            actives = (init.get(option) or {}).get("actives") or {}
-            for aid, active in actives.items():
-                clean = str(active.get("name", "")).split(".")[-1]
-                if not clean:
-                    continue
-                try:
-                    aid_key = int(aid)
-                except (TypeError, ValueError):
-                    continue
-                name_by_id[aid_key] = clean
-                # Patch the library's name->id table with the LIVE id. The static table is
-                # stale (e.g. GBPNZD -> 947) while the server now serves it as 1880; without
-                # this, get_candles()/buy() would hit a dead id and silently fetch nothing.
-                if ACTIVES.get(clean) != aid_key:
-                    ACTIVES[clean] = aid_key
-                    repatched += 1
-                is_open = active.get("enabled", True) and not active.get("is_suspended", False)
-                if not is_open:
-                    continue
-                if clean.endswith("-OTC"):
-                    open_otc.add(clean)
-                elif is_real_fx(clean):
-                    open_real.add(clean)
-
-        # cache id -> name (covers new active_ids like 1880) so alerts show real names
+        # cache id -> name so alerts show real pair names
         if self.trade_manager:
             self.trade_manager._live_active_names = name_by_id
         if repatched:
             logger.info(f"[ASSET] Synced {repatched} live active ids into the name->id table")
 
-        logger.info(f"[ASSET] open real-FX: {sorted(open_real) or 'none'} | open OTC pairs: {len(open_otc)}")
+        open_real = sorted(open_kind)
+        logger.info(f"[ASSET] open real-FX: {open_real or 'none'} "
+                    f"(digital: {sorted(digital_open) or 'none'}) | OTC open: {otc_count}")
 
         if not open_real:
             if self.cfg.assets:
-                logger.info("[ASSET] No real (non-OTC) forex open — waiting (OTC disabled by policy)")
+                logger.info("[ASSET] No real (non-OTC) forex open on binary/turbo/digital "
+                            "— waiting (OTC disabled by policy)")
             self.cfg.assets = []
+            self.cfg.asset_kind = {}
             self._assets_resolved = False
             return
 
-        open_pairs = open_real
-
-        # Rank by payout — we trade 15-min binary, so use binary payout (fall back to turbo)
+        # ── 3) rank by payout (digital payout for digital pairs, binary/turbo profit otherwise) ──
         try:
             profits = self.iq.get_all_profit()
         except Exception as e:
-            logger.warning(f"[ASSET] get_all_profit failed: {e} — selecting without payout ranking")
+            logger.warning(f"[ASSET] get_all_profit failed: {e} — selecting without binary payout")
             profits = {}
 
+        digital_payout = {}
+        for name in open_real:
+            if open_kind[name] == "digital":
+                try:
+                    p = self.iq.get_digital_payout(name)
+                    digital_payout[name] = (float(p) / 100.0) if p else 0.0
+                except Exception:
+                    digital_payout[name] = 0.0
+
         def payout(name):
+            if open_kind[name] == "digital":
+                return digital_payout.get(name, 0.0)
             p = profits.get(name, {}) if profits else {}
             return float(p.get("binary") or p.get("turbo") or 0)
 
-        ranked = sorted(open_pairs, key=payout, reverse=True)
-        if profits:
+        ranked = sorted(open_real, key=payout, reverse=True)
+        if any(payout(a) > 0 for a in ranked):
             filtered = [a for a in ranked if payout(a) >= self.cfg.min_payout]
             chosen = (filtered or ranked)[: self.cfg.max_assets]
         else:
             chosen = ranked[: self.cfg.max_assets]
 
         if chosen != self.cfg.assets:
-            label = ", ".join(f"{a} {payout(a)*100:.0f}%" for a in chosen) if profits else ", ".join(chosen)
+            label = ", ".join(f"{a}[{open_kind[a]}] {payout(a)*100:.0f}%" for a in chosen)
             logger.info(f"[ASSET] Tradable (by payout): {label}")
         self.cfg.assets = chosen
+        self.cfg.asset_kind = {a: open_kind[a] for a in chosen}
         self._assets_resolved = True
 
     def get_candles(self, asset: str) -> Optional[pd.DataFrame]:

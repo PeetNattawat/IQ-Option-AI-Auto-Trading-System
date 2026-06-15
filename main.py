@@ -460,9 +460,10 @@ class FullTradingBot(TradingBot):
         sig_by_asset = {s["asset"]: s for s in signals}
 
         for asset in assets:
+            name = asset[:-3] if asset.endswith("-op") else asset  # drop IQ '-op' suffix for display
             s = sig_by_asset.get(asset)
             if not s:
-                lines.append(f"⬜ <b>{asset}</b> — รอข้อมูล")
+                lines.append(f"⬜ <b>{name}</b> — รอข้อมูล")
                 continue
 
             sig = s.get("signal", "HOLD")
@@ -488,7 +489,7 @@ class FullTradingBot(TradingBot):
             detail = " · ".join(detail_parts)
 
             lines.append(
-                f"{'🔥' if ready else '  '} <b>{asset}</b> {sig_icon} {conf:.0f}%{star}"
+                f"{'🔥' if ready else '  '} <b>{name}</b> {sig_icon} {conf:.0f}%{star}"
                 + (f"\n     {detail}" if detail else "")
             )
 

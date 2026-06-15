@@ -77,6 +77,12 @@ class TelegramBot:
         return "🤖 Bot" if source == "auto" else "✋ Manual"
 
     @staticmethod
+    def _pretty_asset(asset) -> str:
+        """Drop IQ's '-op' real-option suffix for display (GBPNZD-op -> GBPNZD)."""
+        a = str(asset or "?")
+        return a[:-3] if a.endswith("-op") else a
+
+    @staticmethod
     def _dir_label(direction: str) -> str:
         return "CALL 🟢▲" if direction == "CALL" else ("PUT 🔴▼" if direction == "PUT" else direction)
 
@@ -155,7 +161,7 @@ class TelegramBot:
         text = (
             f"🚀 <b>ออกออเดอร์ {self._dir_label(direction)}</b>\n"
             f"\n"
-            f"📌 คู่เงิน: <b>{trade.get('asset', '?')}</b>\n"
+            f"📌 คู่เงิน: <b>{self._pretty_asset(trade.get('asset'))}</b>\n"
             f"💵 ลงทุน: <b>${trade.get('amount', 0):.0f}</b>\n"
             f"{mg_line}"
             f"{conf_line}"
@@ -192,7 +198,7 @@ class TelegramBot:
         text = (
             f"{head}\n"
             f"\n"
-            f"📌 <b>{trade.get('asset', '?')}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
+            f"📌 <b>{self._pretty_asset(trade.get('asset'))}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
             f"💵 ลงทุน ${amount:.0f} → <b>{sign}{pnl:.2f} USD</b>\n"
             f"{mg_line}"
