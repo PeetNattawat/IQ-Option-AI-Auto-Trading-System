@@ -447,6 +447,59 @@ class FullTradingBot(TradingBot):
             f"🕐 {datetime.now().strftime('%H:%M:%S')}"
         )
 
+    def _tg_dashboard_text(self) -> str:
+        signals = state_store.get("signals") or []
+        assets = self.cfg.assets or []
+        threshold = self.cfg.confidence_threshold
+
+        if not assets:
+            return "💤 <b>ไม่มีคู่เงินที่สแกนอยู่</b>\n(ตลาดปิด หรือบอทยังไม่ได้รัน)"
+
+        lines = [f"📡 <b>คู่เงินที่สแกนอยู่ ({len(assets)} คู่)</b>\n"]
+
+        sig_by_asset = {s["asset"]: s for s in signals}
+
+        for asset in assets:
+            s = sig_by_asset.get(asset)
+            if not s:
+                lines.append(f"⬜ <b>{asset}</b> — รอข้อมูล")
+                continue
+
+            sig = s.get("signal", "HOLD")
+            conf = s.get("confidence") or 0
+            rsi = s.get("rsi")
+            adx = s.get("adx")
+
+            if sig == "CALL":
+                sig_icon = "🟢 CALL▲"
+            elif sig == "PUT":
+                sig_icon = "🔴 PUT▼"
+            else:
+                sig_icon = "⚪ HOLD"
+
+            ready = sig in ("CALL", "PUT") and conf >= threshold
+            star = " ⭐" if ready else ""
+
+            detail_parts = []
+            if rsi is not None:
+                detail_parts.append(f"RSI {rsi:.0f}")
+            if adx is not None:
+                detail_parts.append(f"ADX {adx:.0f}")
+            detail = " · ".join(detail_parts)
+
+            lines.append(
+                f"{'🔥' if ready else '  '} <b>{asset}</b> {sig_icon} {conf:.0f}%{star}"
+                + (f"\n     {detail}" if detail else "")
+            )
+
+        ready_count = sum(
+            1 for s in signals
+            if s.get("signal") in ("CALL", "PUT") and (s.get("confidence") or 0) >= threshold
+        )
+        lines.append(f"\n🎯 เข้าเงื่อนไข: <b>{ready_count}/{len(assets)}</b> คู่ (≥{threshold:.0f}%)")
+        lines.append(f"🕐 {datetime.now().strftime('%H:%M:%S')}")
+        return "\n".join(lines)
+
     def _tg_status_text(self) -> str:
         r = self.build_risk()
         act = (state_store.get("activity") or {}).get("msg", "-")
@@ -481,6 +534,8 @@ class FullTradingBot(TradingBot):
             await self.tg.send(self._tg_status_text())
         elif cmd in ("summary", "pnl", "today", "sum"):
             await self.tg.send(self._tg_summary_text())
+        elif cmd in ("dashboard", "pairs", "scan", "d"):
+            await self.tg.send(self._tg_dashboard_text())
         else:
             await self.tg.send(
                 "📋 <b>คำสั่งที่ใช้ได้</b>\n"
@@ -488,7 +543,8 @@ class FullTradingBot(TradingBot):
                 "/stop — หยุดชั่วคราว\n"
                 "/restart — รีสตาร์ทบอท\n"
                 "/status — ดูสถานะตอนนี้\n"
-                "/summary — สรุปกำไรวันนี้"
+                "/summary — สรุปกำไรวันนี้\n"
+                "/dashboard — ดูคู่เงินที่สแกนอยู่"
             )
 
     async def telegram_command_loop(self):
@@ -504,7 +560,7 @@ class FullTradingBot(TradingBot):
                 offset = backlog[-1]["update_id"] + 1
         except Exception:
             pass
-        await self.tg.send("🎮 พร้อมรับคำสั่ง: /start /stop /restart /status /summary")
+        await self.tg.send("🎮 พร้อมรับคำสั่ง: /start /stop /restart /status /summary /dashboard")
         while True:
             try:
                 updates = await self.tg.get_updates(offset=offset, timeout=25)
