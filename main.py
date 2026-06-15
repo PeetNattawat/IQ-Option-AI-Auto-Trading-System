@@ -649,6 +649,13 @@ class FullTradingBot(TradingBot):
             await broadcast({"type": "update", "data": state_store})
             return
 
+        # Resolve tradable real-forex pairs up front so the start alert / dashboard agree
+        # (otherwise the alert shows the 5 default majors while the dashboard shows 0).
+        try:
+            await asyncio.wait_for(asyncio.to_thread(self.resolve_assets), timeout=60)
+        except Exception as e:
+            logger.warning(f"[ASSET] initial resolve failed: {e}")
+
         # Push balance + initial state immediately so the dashboard fills in before the
         # first (possibly slow) scan cycle finishes.
         try:

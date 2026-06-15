@@ -378,6 +378,26 @@ class TradeManager:
         # Per-asset Martingale ladder: each pair recovers its own losses independently,
         # so up to max_open_positions pairs can run concurrent ladders.
         self.asset_step = {}  # asset -> 0-indexed current step (0 = base stake)
+        # Live active_id -> name map (filled by resolve_assets from get_all_init_v2),
+        # so platform-opened trades show real pair names even for new ids the static table lacks.
+        self._live_active_names = {}
+
+    def resolve_active_name(self, active_id) -> str:
+        """Best-effort active_id -> readable pair name. Tries the live map, then the
+        static table, then a live server lookup, finally the raw id."""
+        if active_id is None:
+            return "?"
+        live = self._live_active_names or {}
+        name = live.get(active_id) or live.get(str(active_id)) or ACTIVE_NAMES.get(active_id)
+        if name:
+            return name
+        try:
+            n = self.iq.get_name_by_activeId(active_id)
+            if n:
+                return str(n).split(".")[-1]
+        except Exception:
+            pass
+        return str(active_id)
 
     def _load_trades(self) -> list:
         try:
@@ -665,7 +685,7 @@ class TradeManager:
                     continue
 
                 # New trade opened outside the bot
-                asset = ACTIVE_NAMES.get(msg.get("active_id"), str(msg.get("active_id")))
+                asset = self.resolve_active_name(msg.get("active_id"))
                 direction = (raw.get("direction") or "").upper()
                 amount = float(msg.get("invest") or raw.get("amount") or 0)
                 open_ms = msg.get("open_time") or raw.get("open_time_millisecond")
@@ -935,25 +955,23 @@ class TradingBot:
         return False
 
     def resolve_assets(self):
-        """Pick the most attractive REAL (non-OTC) forex pairs that are open for binary,
-        ranked by payout (highest first). OTC pairs are never traded."""
-        open_time = None
+        """Pick open REAL (non-OTC) forex pairs for binary/turbo, ranked by payout.
+        Reads the live instrument list (get_all_init_v2): each active carries its id,
+        name (front.XXX / front.XXX-OTC) and suspended flag — authoritative, and works
+        for brand-new active_ids the static library table doesn't know about."""
+        init = None
         for attempt in range(3):
             try:
-                ot = self.iq.get_all_open_time()
-                if ot is not None:  # accept even if sections are empty dicts
-                    open_time = ot
+                data = self.iq.get_all_init_v2()
+                if data:
+                    init = data
                     break
             except Exception as e:
-                logger.warning(f"[ASSET] get_all_open_time attempt {attempt + 1} failed: {e}")
+                logger.warning(f"[ASSET] get_all_init_v2 attempt {attempt + 1} failed: {e}")
             time.sleep(1.5)
-        if open_time is None:
-            logger.warning("[ASSET] open-markets endpoint unavailable — will retry next cycle")
+        if not init:
+            logger.warning("[ASSET] instrument list unavailable — will retry next cycle")
             return
-
-        top_keys = list(open_time.keys())
-        counts = {k: len(open_time.get(k, {})) for k in top_keys}
-        logger.info(f"[ASSET] get_all_open_time keys: {top_keys} | counts: {counts}")
 
         majors = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
 
@@ -962,23 +980,40 @@ class TradingBot:
                 return False
             return len(name) == 6 and name[:3] in majors and name[3:] in majors
 
-        # Collect all real forex pairs marked open across binary / turbo / digital
-        open_pairs = set()
-        for kind in ("binary", "turbo", "digital"):
-            section = open_time.get(kind) or {}
-            for name, info in section.items():
-                is_open = info.get("open") if isinstance(info, dict) else bool(info)
-                if is_open and is_real_fx(name):
-                    open_pairs.add(name)
+        open_real, open_otc, name_by_id = set(), set(), {}
+        for option in ("binary", "turbo"):
+            actives = (init.get(option) or {}).get("actives") or {}
+            for aid, active in actives.items():
+                clean = str(active.get("name", "")).split(".")[-1]
+                if not clean:
+                    continue
+                try:
+                    aid_key = int(aid)
+                except (TypeError, ValueError):
+                    aid_key = aid
+                name_by_id[aid_key] = clean
+                is_open = active.get("enabled", True) and not active.get("is_suspended", False)
+                if not is_open:
+                    continue
+                if clean.endswith("-OTC"):
+                    open_otc.add(clean)
+                elif is_real_fx(clean):
+                    open_real.add(clean)
 
-        logger.info(f"[ASSET] Real forex pairs currently open: {sorted(open_pairs) or 'none'}")
+        # cache id -> name (covers new active_ids like 1880) so alerts show real names
+        if self.trade_manager:
+            self.trade_manager._live_active_names = name_by_id
 
-        if not open_pairs:
+        logger.info(f"[ASSET] open real-FX: {sorted(open_real) or 'none'} | open OTC pairs: {len(open_otc)}")
+
+        if not open_real:
             if self.cfg.assets:
-                logger.info("[ASSET] No real forex pairs open — waiting (OTC disabled)")
+                logger.info("[ASSET] No real (non-OTC) forex open — waiting (OTC disabled by policy)")
             self.cfg.assets = []
             self._assets_resolved = False
             return
+
+        open_pairs = open_real
 
         # Rank by payout — we trade 15-min binary, so use binary payout (fall back to turbo)
         try:

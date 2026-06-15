@@ -1,6 +1,6 @@
 """
 Diagnostic: resolve what active_id 1880 really is, straight from IQ Option's
-LIVE server data (not the outdated static library table).
+LIVE instrument list (get_all_init_v2). OTC instruments are named "front.XXX-OTC".
 Run on the VM:  python3 diag_active.py
 """
 import os
@@ -14,40 +14,31 @@ print("connected:", ok, reason)
 iq.change_balance(os.getenv("IQ_ACCOUNT", "PRACTICE"))
 
 TARGET = 1880
+init = iq.get_all_init_v2()
 
-# ── 1) Live instrument list from the server (binary + turbo) ──
-try:
-    init = iq.get_all_init_v2()
-except Exception as e:
-    init = None
-    print("get_all_init_v2 failed:", e)
+found = False
+open_real, open_otc = [], []
+for option in ("binary", "turbo"):
+    actives = (init.get(option) or {}).get("actives") or {}
+    for aid, active in actives.items():
+        clean = str(active.get("name", "")).split(".")[-1]
+        is_open = active.get("enabled", True) and not active.get("is_suspended", False)
+        if str(aid) == str(TARGET):
+            found = True
+            print(f"\n[FOUND] active_id {aid} in {option}")
+            print(f"  name      = {active.get('name')}  (clean: {clean})")
+            print(f"  is OTC?   = {clean.endswith('-OTC')}")
+            print(f"  enabled   = {active.get('enabled')}  suspended = {active.get('is_suspended')}")
+        if is_open and len(clean) >= 6:
+            (open_otc if clean.endswith("-OTC") else open_real).append(clean)
 
-if init:
-    for kind in ("binary", "turbo"):
-        actives = (init.get(kind) or {}).get("actives") or {}
-        for aid, info in actives.items():
-            if str(aid) == str(TARGET):
-                name = info.get("name")          # e.g. "front.GBPNZD"
-                ticker = info.get("ticker")
-                is_otc = info.get("is_otc")
-                susp = info.get("is_suspended")
-                print(f"\n[FOUND in {kind}] id={aid}")
-                print(f"  name      = {name}")
-                print(f"  ticker    = {ticker}")
-                print(f"  is_otc    = {is_otc}")
-                print(f"  suspended = {susp}")
+if not found:
+    print(f"\n[NOT FOUND] active_id {TARGET} not in binary/turbo actives")
+    try:
+        print("  live name lookup ->", iq.get_name_by_activeId(TARGET))
+    except Exception as e:
+        print("  name lookup failed:", e)
 
-# ── 2) Cross-check via open_time: is this pair listed as -OTC? ──
-print("\n── get_all_open_time: pairs containing GBPNZD/1880 ──")
-ot = iq.get_all_open_time()
-for kind in ("binary", "turbo"):
-    for n, i in (ot.get(kind) or {}).items():
-        if "GBPNZD" in n.upper():
-            print(f"  {kind}: {n:15s} open={i.get('open')}")
-
-# ── 3) What real (non-OTC) forex IS open right now ──
-print("\n── real (non-OTC) forex open right now ──")
-for kind in ("binary", "turbo"):
-    real = [n for n, i in (ot.get(kind) or {}).items()
-            if i.get("open") and not n.endswith("-OTC") and len(n) == 6]
-    print(f"  {kind}: {real}")
+print("\n── open REAL (non-OTC) pairs ──")
+print(sorted(set(open_real)) or "NONE")
+print("\n── open OTC pairs count ──", len(set(open_otc)))
