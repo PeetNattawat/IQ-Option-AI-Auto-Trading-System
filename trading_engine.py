@@ -975,14 +975,19 @@ class TradingBot:
         We therefore also read the digital underlying list (authoritative open windows via
         each pair's `schedule`). OTC is never selected (policy: real forex only)."""
 
+        # Fiat-currency whitelist: IQ-tradeable majors covering all real forex crosses.
+        # Excludes crypto (BTC/ETH), gold (XAU), silver (XAG), oil (USO), etc. by construction.
+        FIAT = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
+
         def is_fx(name):
-            # real (non-OTC) forex. IQ names the REAL binary/turbo option "XXXXXX-op",
+            # real (non-OTC) FIAT forex only. IQ names the REAL binary/turbo option "XXXXXX-op",
             # the OTC (synthetic) one "XXXXXX-OTC", and older listings are bare 6-letter.
-            # Strip a trailing "-op" before checking the 6-letter currency pair.
+            # Strip a trailing "-op" before checking, then require BOTH 3-char halves to be
+            # whitelisted fiat currencies (rejects crypto/gold/oil/silver pairs).
             if name.endswith("-OTC"):              # never trade OTC (synthetic) pairs
                 return False
             base = name[:-3] if name.endswith("-op") else name
-            return len(base) == 6 and base[:3].isalpha() and base[3:].isalpha()
+            return len(base) == 6 and base[:3] in FIAT and base[3:] in FIAT
 
         open_kind = {}        # name -> "digital" | "binary" | "turbo"  (digital preferred for real FX)
         name_by_id = {}       # active_id -> name (for readable alert names)
