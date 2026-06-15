@@ -981,6 +981,7 @@ class TradingBot:
             return len(name) == 6 and name[:3] in majors and name[3:] in majors
 
         open_real, open_otc, name_by_id = set(), set(), {}
+        repatched = 0
         for option in ("binary", "turbo"):
             actives = (init.get(option) or {}).get("actives") or {}
             for aid, active in actives.items():
@@ -990,8 +991,14 @@ class TradingBot:
                 try:
                     aid_key = int(aid)
                 except (TypeError, ValueError):
-                    aid_key = aid
+                    continue
                 name_by_id[aid_key] = clean
+                # Patch the library's name->id table with the LIVE id. The static table is
+                # stale (e.g. GBPNZD -> 947) while the server now serves it as 1880; without
+                # this, get_candles()/buy() would hit a dead id and silently fetch nothing.
+                if ACTIVES.get(clean) != aid_key:
+                    ACTIVES[clean] = aid_key
+                    repatched += 1
                 is_open = active.get("enabled", True) and not active.get("is_suspended", False)
                 if not is_open:
                     continue
@@ -1003,6 +1010,8 @@ class TradingBot:
         # cache id -> name (covers new active_ids like 1880) so alerts show real names
         if self.trade_manager:
             self.trade_manager._live_active_names = name_by_id
+        if repatched:
+            logger.info(f"[ASSET] Synced {repatched} live active ids into the name->id table")
 
         logger.info(f"[ASSET] open real-FX: {sorted(open_real) or 'none'} | open OTC pairs: {len(open_otc)}")
 
