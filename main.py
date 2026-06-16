@@ -47,11 +47,18 @@ def load_runtime_config() -> dict:
         return {}
 
 
-# Settings that can be changed from the dashboard and persist across restarts
+# Settings that can be changed from the dashboard and persist across restarts.
+# timeframe is intentionally env-only (IQ_TIMEFRAME) — not a runtime field — to keep
+# the timeframe/expiry pair consistent. See item 8 note below.
+# A/B candidate: M15 (IQ_TIMEFRAME=900) with expiry_minutes=30-45 (set in config.json).
 RUNTIME_FIELDS = [
     "trade_amount", "confidence_threshold", "expiry_minutes", "max_open_positions",
     "martingale_enabled", "martingale_base", "martingale_multiplier", "martingale_max_steps",
-    "max_trades_per_day", "max_consecutive_losses", "daily_profit_target", "daily_loss_limit",
+    "max_trades_per_day", "max_consecutive_losses", "loss_cooldown_minutes",
+    "daily_profit_target", "daily_loss_limit",
+    "adx_min", "dir_margin",                         # quality gates (item 4)
+    "rsi_call_min", "rsi_call_max",                  # RSI zones (item 5)
+    "rsi_put_min", "rsi_put_max",
 ]
 
 
@@ -62,18 +69,23 @@ def save_runtime_config(cfg: TradingConfig):
 
 
 def apply_runtime_config(cfg: TradingConfig, rt: dict):
-    """Apply persisted/dashboard settings onto cfg, coercing to the field's type."""
+    """Apply persisted/dashboard settings onto cfg, coercing to the field's type.
+    Martingale OFF (default): max_consecutive_losses is left as-is so the 4-loss
+    cooldown fires independently of the (disabled) martingale ladder."""
     for k in RUNTIME_FIELDS:
         if k not in rt:
             continue
-        cur = getattr(cfg, k)
+        cur = getattr(cfg, k, None)
+        if cur is None:
+            continue
         try:
             val = bool(rt[k]) if isinstance(cur, bool) else type(cur)(rt[k])
         except (TypeError, ValueError):
             continue
         setattr(cfg, k, val)
-    # keep base stake and martingale base in sync (single "เงินต่อไม้" control), and
-    # make the consecutive-loss pause fire only AFTER the full ladder is lost
+    # When martingale is ON: keep base stake in sync and ensure the consecutive-loss
+    # pause only fires after the full ladder has been exhausted.
+    # When OFF: do NOT touch max_consecutive_losses — let the configured value (e.g. 4) stand.
     if cfg.martingale_enabled:
         cfg.trade_amount = cfg.martingale_base
         cfg.max_consecutive_losses = max(cfg.max_consecutive_losses, cfg.martingale_max_steps)
@@ -91,6 +103,7 @@ class FullTradingBot(TradingBot):
         self.tg = tg
         self._cmd_queue: asyncio.Queue = asyncio.Queue()
         self._paused = False
+        self._cooldown_until = 0.0  # epoch secs; > now = in loss-cooldown (auto-resumes, NOT a hard pause)
         self._iq_lock = asyncio.Lock()  # serialize IQ network calls between run_cycle and the sync loop
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
@@ -134,9 +147,17 @@ class FullTradingBot(TradingBot):
                                      for i in range(self.cfg.martingale_max_steps)],
             "max_trades_per_day": self.cfg.max_trades_per_day,
             "max_consecutive_losses": self.cfg.max_consecutive_losses,
+            "loss_cooldown_minutes": self.cfg.loss_cooldown_minutes,
             "max_open_positions": self.cfg.max_open_positions,
             "daily_profit_target": self.cfg.daily_profit_target,
             "daily_loss_limit": self.cfg.daily_loss_limit,
+            # Quality gates — dashboard can read/override these (items 4 & 5)
+            "adx_min": self.cfg.adx_min,
+            "dir_margin": self.cfg.dir_margin,
+            "rsi_call_min": self.cfg.rsi_call_min,
+            "rsi_call_max": self.cfg.rsi_call_max,
+            "rsi_put_min": self.cfg.rsi_put_min,
+            "rsi_put_max": self.cfg.rsi_put_max,
         }
 
     # ── Override run_cycle to send Telegram alerts ──
@@ -248,9 +269,13 @@ class FullTradingBot(TradingBot):
         # max_open_positions concurrent trades, one per asset (each its own Martingale lane).
         candidates.sort(key=lambda s: s.confidence, reverse=True)
         placed = None
+        in_cooldown = time.time() < self._cooldown_until
+        if in_cooldown:
+            remain = int((self._cooldown_until - time.time()) / 60) + 1
+            self.log_activity("⏳", f"พักหลังแพ้ติดกัน — เหลืออีก ~{remain} นาที จึงกลับมาเปิดออเดอร์", phase="cooldown")
         slots_free = max(0, self.cfg.max_open_positions - self.trade_manager.open_auto_count())
         for signal in candidates:
-            if slots_free <= 0:
+            if in_cooldown or slots_free <= 0:
                 break
             trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
             if trade:
@@ -284,13 +309,26 @@ class FullTradingBot(TradingBot):
             except Exception as e:
                 logger.warning(f"[RESULT] check_results failed/timeout: {e}")
 
-        # Risk: pause on consecutive losses
-        if self.trade_manager.consecutive_losses >= self.cfg.max_consecutive_losses:
-            self._paused = True
-            msg = f"{self.cfg.max_consecutive_losses} consecutive losses — bot paused"
+        # Risk: COOL DOWN (not a permanent pause) after a run of losses, then auto-resume.
+        # A hard pause here used to deadlock: /start cleared _paused but consecutive_losses
+        # stayed at the cap, so can_trade() blocked every entry and the bot never traded again.
+        # Now we pause new entries for loss_cooldown_minutes, reset the counter so the cooldown
+        # timer is the only gate, and resume automatically when it expires.
+        if (self.trade_manager.consecutive_losses >= self.cfg.max_consecutive_losses
+                and time.time() >= self._cooldown_until):
+            lost = self.trade_manager.consecutive_losses
+            cd = max(1, self.cfg.loss_cooldown_minutes)
+            self._cooldown_until = time.time() + cd * 60
+            self.trade_manager.consecutive_losses = 0  # reset so the cooldown timer is the only gate
+            msg = f"{self.cfg.max_consecutive_losses} consecutive losses — cooling down {cd} min, then auto-resume"
             logger.warning(f"[RISK] {msg}")
-            self.log_activity("🛑", f"หยุดอัตโนมัติ: แพ้ติดกัน {self.trade_manager.consecutive_losses} ไม้ (ครบเพดาน)", level="error", phase="paused")
+            self.log_activity("🛑", f"แพ้ติดกัน {lost} ไม้ — พักเทรด {cd} นาที แล้วกลับมาต่ออัตโนมัติ", level="error", phase="cooldown")
             asyncio.create_task(self.tg.alert_risk_pause(msg))
+        # auto-resume notice when a loss-cooldown has just elapsed
+        elif self._cooldown_until and time.time() >= self._cooldown_until:
+            self._cooldown_until = 0.0
+            self.log_activity("▶️", "ครบเวลาพักหลังแพ้ติดกัน — กลับมาเปิดออเดอร์ต่อ", phase="running")
+            asyncio.create_task(self.tg.alert_bot_resumed())
 
         stats = self.trade_manager.get_stats()
         state_store.update({
@@ -329,8 +367,14 @@ class FullTradingBot(TradingBot):
     # ── Command handler from WebSocket ──
     async def handle_command(self, cmd: str, **kwargs):
         if cmd == "start":
-            was_paused = self._paused
+            was_paused = self._paused or time.time() < self._cooldown_until
             self._paused = False
+            # Clear any loss-cooldown and reset the streak counter — an explicit resume must
+            # actually let the bot trade again (otherwise can_trade() keeps blocking on the old
+            # consecutive_losses count and the bot scans forever without placing an order).
+            self._cooldown_until = 0.0
+            if self.trade_manager:
+                self.trade_manager.consecutive_losses = 0
             self.running = True
             logger.info("[CMD] Bot started")
             self.log_activity("▶️", "เริ่ม/เล่นต่อบอท — กำลังกลับไปสแกน", phase="running")
@@ -755,13 +799,30 @@ async def main():
         print("      IQ_PASSWORD=yourpassword")
         return
 
+    # ── REAL account validation gate (item 2) ──────────────────────────────
+    # Trading on a REAL account requires an explicit opt-in via IQ_ALLOW_REAL=1.
+    # If that flag is absent the bot forces PRACTICE regardless of IQ_ACCOUNT,
+    # so a misconfigured env can never accidentally trade real money.
+    raw_account_type = os.getenv("IQ_ACCOUNT", "PRACTICE").upper()
+    if raw_account_type == "REAL" and os.getenv("IQ_ALLOW_REAL", "") != "1":
+        raw_account_type = "PRACTICE"
+        logger.warning(
+            "WARNING: REAL blocked — validation gate: set IQ_ALLOW_REAL=1 to override. "
+            "Forcing PRACTICE account."
+        )
+        print(
+            "\n[WARNING] REAL account blocked by safety gate.\n"
+            "          Set IQ_ALLOW_REAL=1 in your .env to enable REAL trading.\n"
+            "          Falling back to PRACTICE.\n"
+        )
+
     assets_env = os.getenv("IQ_ASSETS", "AUTO").strip()
     auto_assets = assets_env.upper() == "AUTO"
 
     cfg = TradingConfig(
         email=email,
         password=password,
-        account_type=os.getenv("IQ_ACCOUNT", "PRACTICE"),
+        account_type=raw_account_type,
         assets=None if auto_assets else assets_env.split(","),
         auto_discover_assets=auto_assets,
         max_assets=int(os.getenv("IQ_MAX_ASSETS", "12")),
@@ -769,10 +830,11 @@ async def main():
         trade_amount=float(os.getenv("IQ_AMOUNT", "50.0")),
         confidence_threshold=float(os.getenv("IQ_CONFIDENCE", "70.0")),
         max_consecutive_losses=int(os.getenv("IQ_MAX_LOSSES", "4")),
-        max_open_positions=int(os.getenv("IQ_MAX_OPEN", "3")),
+        loss_cooldown_minutes=int(os.getenv("IQ_LOSS_COOLDOWN", "30")),
+        max_open_positions=int(os.getenv("IQ_MAX_OPEN", "1")),
         max_trades_per_day=int(os.getenv("IQ_MAX_DAY_TRADES", "20")),
         daily_profit_target=float(os.getenv("IQ_DAILY_TARGET", "200.0")),
-        daily_loss_limit=float(os.getenv("IQ_DAILY_LOSS_LIMIT", "0")),
+        daily_loss_limit=float(os.getenv("IQ_DAILY_LOSS_LIMIT", "150.0")),  # match config default so a missing config.json never silently disables the loss limit
     )
 
     # Dashboard-saved settings override env

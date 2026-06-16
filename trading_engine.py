@@ -58,6 +58,7 @@ class TradingConfig:
     # Assets to monitor
     assets: list = None
     timeframe: int = 60          # seconds: 60=M1, 300=M5, 900=M15, 1800=M30
+    # A/B candidate: M15 (timeframe=900) with expiry_minutes=30-45 for slower trend signals
     candles_history: int = 250   # how many candles to load (must be >= ema_trend + 10)
 
     # Signal thresholds
@@ -67,37 +68,40 @@ class TradingConfig:
     rsi_period: int = 14
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
-    rsi_call_min: float = 50.0
-    rsi_call_max: float = 70.0
-    rsi_put_min: float = 30.0
-    rsi_put_max: float = 50.0
+    # Tightened RSI zones (item 5): narrow the scoring window to reduce chop entries
+    rsi_call_min: float = 52.0   # was 50
+    rsi_call_max: float = 63.0   # was 70
+    rsi_put_min: float = 37.0    # was 30
+    rsi_put_max: float = 48.0    # was 50
     atr_period: int = 14
     atr_multiplier: float = 1.5  # ATR must be > avg * multiplier for high vol
     volume_period: int = 20
     volume_multiplier: float = 1.2  # Volume must be > avg * multiplier
 
     # Direction filters (anti-chop / anti-bias)
-    adx_min: float = 22.0        # below this = no real trend -> HOLD (don't trade sideways)
-    dir_margin: float = 15.0     # dominant side must beat the other by this many directional points
+    adx_min: float = 28.0        # was 22 — tighter quality gate (item 4)
+    dir_margin: float = 30.0     # was 15 — dominant side must beat the other by this many points (item 4)
 
     # Trade settings
     trade_amount: float = 50.0   # base stake per trade (account currency)
     expiry_minutes: int = 15     # binary — snaps to the next :00/:15/:30/:45 quarter-hour
     max_trades_per_hour: int = 12
     max_consecutive_losses: int = 4
+    loss_cooldown_minutes: int = 30  # after max_consecutive_losses: pause new entries this long, then auto-resume
     confidence_threshold: float = 70.0  # min score to trade
 
-    # Martingale money management (applies to BOT/auto trades only)
-    martingale_enabled: bool = True
+    # Martingale money management — DISABLED by default (item 1)
+    # When off, every auto trade uses the flat trade_amount stake.
+    martingale_enabled: bool = False  # was True
     martingale_base: float = 50.0       # step 1 stake
     martingale_multiplier: float = 2.0  # each loss multiplies the next stake
     martingale_max_steps: int = 4       # 50 -> 100 -> 200 -> 400, then reset
 
     # Risk limits (dashboard counters)
-    max_open_positions: int = 3   # up to 3 concurrent auto trades (independent Martingale lanes)
+    max_open_positions: int = 1   # one open auto trade at a time (max reliability; was 3 concurrent lanes)
     max_trades_per_day: int = 20
     daily_profit_target: float = 200.0
-    daily_loss_limit: float = 0.0   # 0 = disabled
+    daily_loss_limit: float = 150.0   # 3 × $50 stake (item 3); 0 = disabled
 
     # Asset discovery
     auto_discover_assets: bool = False  # scan all open forex pairs (binary/turbo/digital)
@@ -111,6 +115,60 @@ class TradingConfig:
             self.assets = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "EURGBP"]
         # name -> instrument kind ("digital" | "binary" | "turbo"), filled by resolve_assets
         self.asset_kind = {}
+
+
+# ─────────────────────────────────────────
+#  BAND HELPERS  (items 6 & 7)
+# ─────────────────────────────────────────
+def adx_band(adx: float) -> str:
+    """Classify ADX into coarse bands for bucket logging and win-rate veto.
+    Trades are only placed when adx >= adx_min (28), so the first band won't appear
+    in live trade records — it exists so the band function is complete for analysis."""
+    if adx < 28:
+        return "lt28"
+    if adx < 34:
+        return "28-34"
+    if adx < 40:
+        return "34-40"
+    return "40+"
+
+
+def rsi_band(rsi: float) -> str:
+    """Classify RSI into 5-point bands (e.g. 50.0-54.9 -> '50-55').
+    Coarse enough to accumulate samples quickly as the trade count grows."""
+    bucket = int(rsi // 5) * 5
+    return f"{bucket}-{bucket + 5}"
+
+
+def signal_bucket_key(asset: str, side: str, adx: float, rsi: float) -> str:
+    """Unique string key for the (asset, direction, ADX band, RSI band) bucket."""
+    return f"{asset}|{side}|{adx_band(adx)}|{rsi_band(rsi)}"
+
+
+def compute_bucket_winrates(trades: list) -> dict:
+    """Compute realized win-rate per setup bucket from closed AUTO trades.
+    Returns {bucket_key: {"wins": int, "total": int, "winrate": float}}."""
+    buckets: dict = {}
+    for t in trades:
+        if t.get("source") != "auto" or t.get("status") != "closed":
+            continue
+        adx = t.get("adx")
+        rsi = t.get("rsi")
+        if adx is None or rsi is None:
+            continue
+        key = signal_bucket_key(
+            t.get("asset", ""),
+            t.get("direction", ""),
+            float(adx),
+            float(rsi),
+        )
+        rec = buckets.setdefault(key, {"wins": 0, "total": 0})
+        rec["total"] += 1
+        if t.get("result") == "WIN":
+            rec["wins"] += 1
+    for rec in buckets.values():
+        rec["winrate"] = round(rec["wins"] / rec["total"], 4) if rec["total"] else 0.0
+    return buckets
 
 
 # ─────────────────────────────────────────
@@ -324,6 +382,25 @@ class SignalEngine:
             gates.append(f"ทิศไม่ชัด (นำแค่ {margin} แต้ม)")
         if confidence < self.cfg.confidence_threshold:
             gates.append(f"confidence {confidence:.0f}% < {self.cfg.confidence_threshold:.0f}%")
+
+        # ── MACD HARD GATE (item 4): chosen side must have MACD confirmation ──
+        # CALL requires macd_hist > 0 AND macd_hist > prev_macd
+        # PUT  requires macd_hist < 0 AND macd_hist < prev_macd
+        macd_confirms_call = macd_hist > 0 and macd_hist > prev_macd
+        macd_confirms_put = macd_hist < 0 and macd_hist < prev_macd
+        if side == "CALL" and not macd_confirms_call:
+            gates.append(f"MACD ไม่ยืนยัน CALL (hist={macd_hist:.5f}, prev={prev_macd:.5f})")
+        elif side == "PUT" and not macd_confirms_put:
+            gates.append(f"MACD ไม่ยืนยัน PUT (hist={macd_hist:.5f}, prev={prev_macd:.5f})")
+
+        # ── RSI HARD VETO (item 5): extremes that contradict the direction ──
+        # CALL vetoed when rsi > 66 (too overbought for a new long entry)
+        # PUT  vetoed when rsi < 34 (too oversold for a new short entry)
+        if side == "CALL" and rsi > 66:
+            gates.append(f"RSI {rsi:.1f} > 66 — veto CALL (overbought)")
+        elif side == "PUT" and rsi < 34:
+            gates.append(f"RSI {rsi:.1f} < 34 — veto PUT (oversold)")
+
         if gates:
             return self._hold(asset, row, rsi, atr, adx, macd_hist,
                               reasons[:2] + [f"⛔ {side_label} ถูกกรอง: " + " · ".join(gates)], confidence)
@@ -369,6 +446,10 @@ class SignalEngine:
 class TradeManager:
     """Manages trade execution, risk rules, and result tracking"""
 
+    # Minimum closed samples before the bucket veto activates for a given bucket (item 6)
+    BUCKET_MIN_SAMPLES = 10
+    BUCKET_MIN_WINRATE = 0.50  # veto if winrate is below this threshold
+
     def __init__(self, cfg: TradingConfig, iq: IQ_Option):
         self.cfg = cfg
         self.iq = iq
@@ -384,6 +465,8 @@ class TradeManager:
         # Live active_id -> name map (filled by resolve_assets from get_all_init_v2),
         # so platform-opened trades show real pair names even for new ids the static table lacks.
         self._live_active_names = {}
+        # Cached bucket win-rates; rebuilt each time execute_trade is called (cheap at <1k trades)
+        self._bucket_cache: dict = {}
 
     def resolve_active_name(self, active_id) -> str:
         """Best-effort active_id -> readable pair name. Tries the live map, then the
@@ -429,8 +512,9 @@ class TradeManager:
         return [round(base * (mult ** i), 2) for i in range(steps)]
 
     def next_auto_stake(self, asset: str) -> float:
-        """Stake for the next bot trade on this asset: base when Martingale is off,
-        else this asset's current ladder step."""
+        """Stake for the next bot trade on this asset.
+        When martingale is OFF (default), always returns the flat base stake (trade_amount).
+        When ON, returns the current ladder step amount for this asset."""
         if not self.cfg.martingale_enabled:
             return self.cfg.trade_amount
         seq = self.martingale_sequence()
@@ -439,7 +523,8 @@ class TradeManager:
 
     def _advance_martingale(self, asset: str, result: str):
         """After a BOT trade closes: climb that asset's ladder on loss, reset on win.
-        Reaching the final step then losing resets to base (accept the drawdown)."""
+        Reaching the final step then losing resets to base (accept the drawdown).
+        No-op when martingale is disabled."""
         if not self.cfg.martingale_enabled:
             return
         step = self.asset_step.get(asset, 0)
@@ -498,10 +583,31 @@ class TradeManager:
             return True, f"Vetoed by learning rule: {rule.get('reason', 'unknown')}"
         return False, ""
 
+    def apply_bucket_veto(self, signal: SignalResult) -> tuple[bool, str]:
+        """Setup-bucket realized win-rate veto (item 6).
+        Vetoes a trade when the (asset, side, ADX-band, RSI-band) bucket has >= 10 closed
+        AUTO samples AND a win-rate below 50%.  With sparse data (<10 per bucket) this is
+        inert by design — it only activates once we have meaningful evidence."""
+        key = signal_bucket_key(signal.asset, signal.signal, signal.adx, signal.rsi)
+        rec = self._bucket_cache.get(key)
+        if rec is None:
+            return False, ""
+        if rec["total"] >= self.BUCKET_MIN_SAMPLES and rec["winrate"] < self.BUCKET_MIN_WINRATE:
+            return True, (
+                f"Bucket veto [{key}]: {rec['wins']}/{rec['total']} wins "
+                f"({rec['winrate']*100:.0f}% < {self.BUCKET_MIN_WINRATE*100:.0f}%)"
+            )
+        return False, ""
+
+    def _refresh_bucket_cache(self):
+        """Recompute bucket win-rates from trade history.  Called before each execute_trade."""
+        self._bucket_cache = compute_bucket_winrates(self.trades)
+
     def _place_order(self, asset: str, direction: str, amount: float, meta: dict) -> Optional[dict]:
         """Place an order on IQ Option and record it. direction: CALL/PUT.
         Routes to digital-spot for assets resolved as 'digital' (real forex usually trades
-        only on digital), otherwise to the binary endpoint."""
+        only on digital), otherwise to the binary endpoint.
+        Persists adx_band and rsi_band for bucket analysis (item 7)."""
         kind = (getattr(self.cfg, "asset_kind", None) or {}).get(asset, "binary")
         action = "call" if direction.upper() == "CALL" else "put"
         duration = self.cfg.expiry_minutes
@@ -518,6 +624,13 @@ class TradeManager:
         except Exception as e:
             logger.error(f"[TRADE] Exception: {e}")
             return None
+
+        # Enrich meta with band dimensions for bucket logging (item 7)
+        adx_val = meta.get("adx")
+        rsi_val = meta.get("rsi")
+        if adx_val is not None and rsi_val is not None:
+            meta["adx_band"] = adx_band(float(adx_val))
+            meta["rsi_band"] = rsi_band(float(rsi_val))
 
         with self._lock:
             trade = {
@@ -553,6 +666,13 @@ class TradeManager:
         vetoed, veto_reason = self.apply_learning_veto(signal)
         if vetoed:
             logger.warning(f"[LEARNING] {veto_reason}")
+            return None
+
+        # Bucket win-rate veto (item 6) — refresh cache from current trade history first
+        self._refresh_bucket_cache()
+        bucket_vetoed, bucket_reason = self.apply_bucket_veto(signal)
+        if bucket_vetoed:
+            logger.warning(f"[BUCKET-VETO] {bucket_reason}")
             return None
 
         step = self.asset_step.get(signal.asset, 0)
