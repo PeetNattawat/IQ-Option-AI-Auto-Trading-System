@@ -637,7 +637,6 @@ class FullTradingBot(TradingBot):
                 continue
 
             new_external = []
-            old_results = {t["id"]: t.get("result") for t in self.trade_manager.trades if t.get("id")}
             async with self._iq_lock:
                 # 1) live balance
                 try:
@@ -656,15 +655,21 @@ class FullTradingBot(TradingBot):
                 except Exception as e:
                     logger.warning(f"[SYNC] external sync failed: {e}")
 
-            # alert + log results for trades that just closed
+            # alert + log every trade that just closed — drained from the engine's queue, so
+            # this fires no matter which loop (5-min cycle / this loop / external sync) closed it
             today_stats = self.trade_manager.get_stats().get("today")
-            for t in self.trade_manager.trades:
-                if t.get("id") and old_results.get(t["id"]) is None and t.get("result"):
+            for t in self.trade_manager.drain_pending_alerts():
+                if t.get("result"):
                     icon = {"WIN": "✅", "LOSS": "❌", "EQUAL": "➖"}.get(t["result"], "•")
                     pnl = t.get("pnl") or 0
                     self.log_activity(icon, f"ปิดไม้ {t['asset']} {t['direction']} → {t['result']} ({pnl:+.2f})",
                                       level="error" if t["result"] == "LOSS" else "info", phase="result")
                     asyncio.create_task(self.tg.alert_result(t, today_stats))
+                # Force-expired (unresolved, slot freed): notify so the user isn't left guessing
+                elif t.get("status") == "expired":
+                    self.log_activity("⏰", f"ออเดอร์ค้าง {t['asset']} {t['direction']} — เคลียร์ช่องแล้ว",
+                                      level="warning", phase="result")
+                    asyncio.create_task(self.tg.alert_expired(t))
 
             # alert any newly discovered platform trades
             for t in new_external:

@@ -79,7 +79,9 @@ class TradingConfig:
     volume_multiplier: float = 1.2  # Volume must be > avg * multiplier
 
     # Direction filters (anti-chop / anti-bias)
-    adx_min: float = 28.0        # was 22 — tighter quality gate (item 4)
+    adx_min: float = 25.0        # 22 -> 28 (overhaul) -> 25: 28 filtered out nearly all entries on
+                                 # ranging days (e.g. 16 Jun: many ADX<28 setups held). 25 still needs
+                                 # a developing trend but unlocks borderline 25-28 setups.
     dir_margin: float = 30.0     # was 15 — dominant side must beat the other by this many points (item 4)
 
     # Trade settings
@@ -89,6 +91,9 @@ class TradingConfig:
     max_consecutive_losses: int = 4
     loss_cooldown_minutes: int = 30  # after max_consecutive_losses: pause new entries this long, then auto-resume
     confidence_threshold: float = 70.0  # min score to trade
+    # Deadlock breaker: if a trade can't be resolved (e.g. IQ connection dropped) by this many
+    # minutes past its expiry, force-expire it so it stops occupying a max_open_positions slot.
+    stale_open_minutes: int = 30
 
     # Martingale money management — DISABLED by default (item 1)
     # When off, every auto trade uses the flat trade_amount stake.
@@ -122,7 +127,7 @@ class TradingConfig:
 # ─────────────────────────────────────────
 def adx_band(adx: float) -> str:
     """Classify ADX into coarse bands for bucket logging and win-rate veto.
-    Trades are only placed when adx >= adx_min (28), so the first band won't appear
+    Trades are only placed when adx >= adx_min (25), so the first band won't appear
     in live trade records — it exists so the band function is complete for analysis."""
     if adx < 28:
         return "lt28"
@@ -459,6 +464,12 @@ class TradeManager:
         self.hourly_trades = deque()
         self.learning_rules = self._load_learning_rules()
         self._lock = threading.RLock()  # guards trades/active_orders across the trading & sync threads
+        # Trades that just closed and still need a Telegram alert. ANY close path (the 5-min
+        # trading cycle, the 15s sync loop, external/web sync) appends here; the alert sender
+        # drains it. This decouples alerting from which loop closed the trade — the old
+        # snapshot-diff approach missed alerts when run_cycle resolved a trade before the
+        # 15s loop's old_results snapshot was taken.
+        self.pending_alerts = []  # list of closed trade dicts awaiting a Telegram alert
         # Per-asset Martingale ladder: each pair recovers its own losses independently,
         # so up to max_open_positions pairs can run concurrent ladders.
         self.asset_step = {}  # asset -> 0-indexed current step (0 = base stake)
@@ -750,19 +761,32 @@ class TradeManager:
 
         with self._lock:
             closed = []
+            expired = []
             for order_id in due:
                 trade = self.active_orders.get(order_id)
                 if not trade:
                     continue  # closed by the sync loop meanwhile
                 p = by_id.get(str(order_id))
                 if not p or p.get("status") != "closed":
+                    # Not in closed history yet. If it's stuck far past expiry (e.g. IQ
+                    # connection was down when it should have resolved), force-expire it so
+                    # it stops deadlocking the open-position slot. Otherwise retry next cycle.
+                    if self.cfg.stale_open_minutes > 0:
+                        try:
+                            opened = datetime.fromisoformat(str(trade["open_time"]))
+                        except (ValueError, KeyError):
+                            opened = None
+                        expiry = trade.get("expiry") or self.cfg.expiry_minutes
+                        if opened and now >= opened + timedelta(minutes=expiry + self.cfg.stale_open_minutes):
+                            self._expire_stale(trade)
+                            expired.append(order_id)
                     continue  # not in closed history yet — try next cycle
                 self._apply_close(trade, p.get("close_reason"), p.get("pnl_net", p.get("pnl")))
                 closed.append(order_id)
 
-            if closed:
+            if closed or expired:
                 self._save_trades()
-            for oid in closed:
+            for oid in closed + expired:
                 self.active_orders.pop(oid, None)
 
     def _apply_close(self, trade: dict, close_reason: str, pnl_raw) -> None:
@@ -783,6 +807,29 @@ class TradeManager:
                 self.consecutive_losses = 0
             self._advance_martingale(trade["asset"], trade["result"])
         logger.info(f"[RESULT] {trade['asset']} {trade['direction']} -> {trade['result']} | PnL: {pnl:+.2f}")
+        self.pending_alerts.append(trade)
+
+    def drain_pending_alerts(self) -> list:
+        """Atomically take and clear the queue of just-closed trades awaiting a Telegram
+        alert. Called by the alert sender; safe regardless of which loop closed the trade."""
+        with self._lock:
+            pending = self.pending_alerts
+            self.pending_alerts = []
+        return pending
+
+    def _expire_stale(self, trade: dict) -> None:
+        """Force-close a trade that never resolved (IQ connection drop / missing history).
+        Marked 'expired' with no PnL so it doesn't pollute win/loss stats, but it IS removed
+        from active_orders so it stops blocking new entries (max_open_positions deadlock)."""
+        trade["status"] = "expired"
+        trade["result"] = None
+        trade["pnl"] = 0.0
+        trade["close_time"] = datetime.now().isoformat()
+        trade["close_reason"] = "stale_unresolved"
+        logger.warning(
+            f"[RESULT] {trade.get('asset')} {trade.get('direction')} -> EXPIRED "
+            f"(unresolved {self.cfg.stale_open_minutes}m past expiry — slot freed)")
+        self.pending_alerts.append(trade)
 
     def sync_external_trades(self) -> list:
         """Discover option trades opened directly on the IQ Option website/app from the

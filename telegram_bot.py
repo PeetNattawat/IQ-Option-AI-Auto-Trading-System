@@ -208,6 +208,20 @@ class TelegramBot:
         )
         return await self.send(text)
 
+    async def alert_expired(self, trade: dict) -> bool:
+        """A trade that could not be resolved (IQ connection drop) and was force-expired
+        to free the open-position slot. No PnL impact — informational only."""
+        text = (
+            f"⏰ <b>ออเดอร์ค้าง — เคลียร์ช่องว่างแล้ว</b>\n"
+            f"\n"
+            f"📌 <b>{self._pretty_asset(trade.get('asset'))}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
+            f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
+            f"⚠️ ปิดผลไม่ได้ (IQ หลุดการเชื่อมต่อ) — ปล่อยช่องให้เทรดต่อ\n"
+            f"ℹ️ ไม่นับแพ้/ชนะ ไม่กระทบยอด\n"
+            f"\n🕐 {self._now()}"
+        )
+        return await self.send(text)
+
     # ─────────────────────────────────────────
     #  RISK / LEARNING
     # ─────────────────────────────────────────
