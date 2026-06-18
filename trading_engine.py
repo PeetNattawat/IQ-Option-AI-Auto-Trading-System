@@ -62,9 +62,9 @@ class TradingConfig:
     candles_history: int = 250   # how many candles to load (must be >= ema_trend + 10)
 
     # Signal thresholds
-    ema_fast: int = 20
-    ema_slow: int = 50
-    ema_trend: int = 200
+    ema_fast: int = 9
+    ema_slow: int = 21
+    ema_trend: int = 50
     rsi_period: int = 14
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
@@ -75,6 +75,12 @@ class TradingConfig:
     rsi_put_max: float = 48.0    # was 50
     atr_period: int = 14
     atr_multiplier: float = 1.5  # ATR must be > avg * multiplier for high vol
+    # ATR hard gate — normalized as % of close price (works across all pairs)
+    # atr_pct = ATR(14) / close
+    # FLOOR: ตลาดต้องมีแรงพอ (กรอง dead market/no-move)
+    # CEILING: ตลาดต้องไม่บ้าเกิน (กรอง news spike / blow-out candle)
+    atr_floor_pct: float = 0.0003   # 0.03% — ต่ำกว่านี้ตลาดนิ่งเกินไป
+    atr_ceiling_pct: float = 0.0035  # 0.35% — สูงกว่านี้ผันผวนเกินจะคาดเดาได้
     volume_period: int = 20
     volume_multiplier: float = 1.2  # Volume must be > avg * multiplier
 
@@ -95,9 +101,9 @@ class TradingConfig:
     # minutes past its expiry, force-expire it so it stops occupying a max_open_positions slot.
     stale_open_minutes: int = 30
 
-    # Martingale money management — DISABLED by default (item 1)
+    # Martingale money management
     # When off, every auto trade uses the flat trade_amount stake.
-    martingale_enabled: bool = False  # was True
+    martingale_enabled: bool = True
     martingale_base: float = 50.0       # step 1 stake
     martingale_multiplier: float = 2.0  # each loss multiplies the next stake
     martingale_max_steps: int = 4       # 50 -> 100 -> 200 -> 400, then reset
@@ -295,10 +301,10 @@ class SignalEngine:
         row = df.iloc[-1]
         prev = df.iloc[-2]
 
-        # Directional points only (max 65): these decide CALL vs PUT.
-        # ATR / Volume / ADX are NOT scored to a side — they are quality gates below,
-        # so "confidence" reflects directional edge, not just market activity.
-        MAX_DIR = 65
+        # Directional points only (max 45): EMA + RSI only.
+        # ATR / ADX / Volume are quality gates (not scored to a side).
+        # MACD and Bollinger Bands removed — strategy is EMA + RSI + ATR only.
+        MAX_DIR = 45
         call = 0
         put = 0
         call_reasons = []
@@ -323,6 +329,9 @@ class SignalEngine:
             put_reasons.append("EMA fast < slow (ขาลงบางส่วน)")
 
         # ── RSI (20 / extreme reversal 10) ──
+        # Reversal (extreme RSI) อนุญาตเฉพาะเมื่อ EMA ไม่ full aligned เท่านั้น
+        # ถ้า EMA full aligned ขาขึ้น → ห้าม PUT reversal (สวนเทรนด์)
+        # ถ้า EMA full aligned ขาลง → ห้าม CALL reversal (สวนเทรนด์)
         rsi = row["rsi"]
         if self.cfg.rsi_call_min <= rsi <= self.cfg.rsi_call_max:
             call += 20; breakdown_call["rsi"] = 20
@@ -330,41 +339,39 @@ class SignalEngine:
         elif self.cfg.rsi_put_min <= rsi <= self.cfg.rsi_put_max:
             put += 20; breakdown_put["rsi"] = 20
             put_reasons.append(f"RSI {rsi:.1f} โซนหมี [{self.cfg.rsi_put_min:.0f}-{self.cfg.rsi_put_max:.0f}]")
-        elif rsi > self.cfg.rsi_overbought:
+        elif rsi > self.cfg.rsi_overbought and not ema_bull:
+            # RSI overbought reversal → PUT ได้เฉพาะตอนที่ EMA ไม่ได้เรียงขาขึ้นสมบูรณ์
             put += 10; breakdown_put["rsi_extreme"] = 10
-            put_reasons.append(f"RSI {rsi:.1f} overbought — ลุ้นกลับตัวลง")
-        elif rsi < self.cfg.rsi_oversold:
+            put_reasons.append(f"RSI {rsi:.1f} overbought — ลุ้นกลับตัวลง (EMA ไม่ full bull)")
+        elif rsi < self.cfg.rsi_oversold and not ema_bear:
+            # RSI oversold reversal → CALL ได้เฉพาะตอนที่ EMA ไม่ได้เรียงขาลงสมบูรณ์
             call += 10; breakdown_call["rsi_extreme"] = 10
-            call_reasons.append(f"RSI {rsi:.1f} oversold — ลุ้นเด้งขึ้น")
+            call_reasons.append(f"RSI {rsi:.1f} oversold — ลุ้นเด้งขึ้น (EMA ไม่ full bear)")
 
-        # ── MACD (15) ──
         macd_hist = row["macd_hist"]
         prev_macd = prev["macd_hist"]
-        if macd_hist > 0 and macd_hist > prev_macd:
-            call += 15; breakdown_call["macd"] = 15
-            call_reasons.append(f"MACD histogram เป็นบวกและเพิ่มขึ้น {macd_hist:.5f}")
-        if macd_hist < 0 and macd_hist < prev_macd:
-            put += 15; breakdown_put["macd"] = 15
-            put_reasons.append(f"MACD histogram เป็นลบและลดลง {macd_hist:.5f}")
-
-        # ── BOLLINGER (5) — only count when it agrees with the EMA trend (no counter-trend knife) ──
         price = row["close"]
-        if price < row["bb_lower"] * 1.001 and row["ema_fast"] >= row["ema_slow"]:
-            call += 5; breakdown_call["bollinger"] = 5
-            call_reasons.append("ราคาแตะ BB ล่างในแนวโน้มขึ้น — ลุ้นเด้ง")
-        if price > row["bb_upper"] * 0.999 and row["ema_fast"] <= row["ema_slow"]:
-            put += 5; breakdown_put["bollinger"] = 5
-            put_reasons.append("ราคาแตะ BB บนในแนวโน้มลง — ลุ้นย่อ")
 
-        # ── QUALITY GATES (not scored to a side) ──
+        # ── ATR HARD GATE — normalized % of close (cross-pair safe) ──
         atr = row["atr"]
         atr_avg = row["atr_avg"] if not pd.isna(row["atr_avg"]) else atr
         atr_high = atr > atr_avg * self.cfg.atr_multiplier
+        atr_pct = atr / price if price > 0 else 0
+        atr_floor_ok = atr_pct >= self.cfg.atr_floor_pct
+        atr_ceiling_ok = atr_pct <= self.cfg.atr_ceiling_pct
         vol = row["volume"]
         vol_avg = row["volume_avg"] if not pd.isna(row["volume_avg"]) else vol
         vol_high = vol > vol_avg * self.cfg.volume_multiplier
         adx = row["adx"]
         adx_ok = adx >= self.cfg.adx_min
+
+        # ATR gate ตรวจก่อน decision — ถ้าไม่ผ่าน ไม่ต้องคำนวณต่อ
+        if not atr_floor_ok:
+            return self._hold(asset, row, rsi, atr, adx, macd_hist,
+                              f"ATR {atr_pct*100:.4f}% < floor {self.cfg.atr_floor_pct*100:.4f}% — ตลาดนิ่งเกินไป ไม่เทรด")
+        if not atr_ceiling_ok:
+            return self._hold(asset, row, rsi, atr, adx, macd_hist,
+                              f"ATR {atr_pct*100:.4f}% > ceiling {self.cfg.atr_ceiling_pct*100:.4f}% — ผันผวนเกินไป ไม่เทรด")
 
         # ── DECISION ──
         # 1) need a clear directional winner (no CALL-on-tie bias)
@@ -381,24 +388,12 @@ class SignalEngine:
 
         # 2) hard filters — any failure => HOLD
         gates = []
-        if not adx_ok:
-            gates.append(f"ADX {adx:.1f} < {self.cfg.adx_min:.0f} (ตลาดออกข้าง)")
         if margin < self.cfg.dir_margin:
             gates.append(f"ทิศไม่ชัด (นำแค่ {margin} แต้ม)")
         if confidence < self.cfg.confidence_threshold:
             gates.append(f"confidence {confidence:.0f}% < {self.cfg.confidence_threshold:.0f}%")
 
-        # ── MACD HARD GATE (item 4): chosen side must have MACD confirmation ──
-        # CALL requires macd_hist > 0 AND macd_hist > prev_macd
-        # PUT  requires macd_hist < 0 AND macd_hist < prev_macd
-        macd_confirms_call = macd_hist > 0 and macd_hist > prev_macd
-        macd_confirms_put = macd_hist < 0 and macd_hist < prev_macd
-        if side == "CALL" and not macd_confirms_call:
-            gates.append(f"MACD ไม่ยืนยัน CALL (hist={macd_hist:.5f}, prev={prev_macd:.5f})")
-        elif side == "PUT" and not macd_confirms_put:
-            gates.append(f"MACD ไม่ยืนยัน PUT (hist={macd_hist:.5f}, prev={prev_macd:.5f})")
-
-        # ── RSI HARD VETO (item 5): extremes that contradict the direction ──
+        # ── RSI HARD VETO: extremes that contradict the direction ──
         # CALL vetoed when rsi > 66 (too overbought for a new long entry)
         # PUT  vetoed when rsi < 34 (too oversold for a new short entry)
         if side == "CALL" and rsi > 66:
@@ -411,8 +406,8 @@ class SignalEngine:
                               reasons[:2] + [f"⛔ {side_label} ถูกกรอง: " + " · ".join(gates)], confidence)
 
         # passed — annotate quality
-        if adx_ok: reasons.append(f"ADX {adx:.1f} — เทรนด์แข็งแรง")
-        if atr_high: reasons.append("ATR สูงกว่าค่าเฉลี่ย — ความผันผวนพอเหมาะ")
+        reasons.append(f"ATR {atr_pct*100:.4f}% ✅ ผ่าน gate [{self.cfg.atr_floor_pct*100:.4f}%–{self.cfg.atr_ceiling_pct*100:.4f}%]")
+        reasons.append(f"ADX {adx:.1f} (info)")
         if vol_high: reasons.append("Volume สูงกว่าค่าเฉลี่ย — ยืนยันแรงซื้อขาย")
 
         return SignalResult(

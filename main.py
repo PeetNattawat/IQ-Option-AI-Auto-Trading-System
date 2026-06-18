@@ -265,27 +265,32 @@ class FullTradingBot(TradingBot):
             self._need_resolve = True
             logger.warning("[DATA] no candles from any asset — will re-resolve tradable markets next cycle")
 
-        # Smart selection: highest-confidence signals first. Open into free slots — up to
-        # max_open_positions concurrent trades, one per asset (each its own Martingale lane).
+        # Smart selection: highest-confidence signal first. With max_open_positions=1 the bot
+        # waits for ANY open position (auto, manual, web) to close before entering a new one.
+        # slots_free is re-read from active_orders live each iteration — never a stale counter.
         candidates.sort(key=lambda s: s.confidence, reverse=True)
         placed = None
         in_cooldown = time.time() < self._cooldown_until
         if in_cooldown:
             remain = int((self._cooldown_until - time.time()) / 60) + 1
             self.log_activity("⏳", f"พักหลังแพ้ติดกัน — เหลืออีก ~{remain} นาที จึงกลับมาเปิดออเดอร์", phase="cooldown")
-        slots_free = max(0, self.cfg.max_open_positions - self.trade_manager.open_auto_count())
         for signal in candidates:
-            if in_cooldown or slots_free <= 0:
+            if in_cooldown:
+                break
+            # Re-query active_orders live every iteration so a trade placed moments ago
+            # (or resolved by external_sync_loop) is immediately reflected.
+            open_now = len(self.trade_manager.active_orders)
+            if open_now >= self.cfg.max_open_positions:
                 break
             trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
             if trade:
                 placed = trade
-                slots_free -= 1
                 state_store["trades"] = self.trade_manager.trades
                 await broadcast({"type": "new_trade", "data": trade})
                 asyncio.create_task(self.tg.alert_trade_open(trade))
                 mg = f" · ไม้ {trade.get('mg_step')}" if trade.get("mg_step") else ""
                 self.log_activity("🚀", f"เปิดออเดอร์ {trade['asset']} {trade['direction']} ที่ {(trade.get('confidence') or 0):.0f}%{mg}", phase="trading")
+                break  # ออกทันที — รอปิดไม้นี้ก่อนจึงจะเปิดถัดไป
 
         # Summarize the decision so the dashboard shows what the bot is doing / waiting for
         best = max(signals_this_cycle, key=lambda s: s.get("confidence") or 0, default=None)
@@ -293,8 +298,8 @@ class FullTradingBot(TradingBot):
         if not got_data:
             self.log_activity("⚠️", "ดึงแท่งเทียนไม่ได้สักคู่ — ตลาดอาจปิดหรือการเชื่อมต่อ IQ มีปัญหา", level="warn", phase="error")
         elif placed is None and candidates:
-            if self.cfg.martingale_enabled and self.trade_manager.open_auto_count() >= 1:
-                reason = "รอผลไม้ Martingale ที่เปิดอยู่ก่อน"
+            if len(self.trade_manager.active_orders) >= self.cfg.max_open_positions:
+                reason = f"รอปิดไม้ที่เปิดอยู่ก่อน ({len(self.trade_manager.active_orders)} open)"
             else:
                 _, reason = self.trade_manager.can_trade()
             self.log_activity("⛔", f"มี {len(candidates)} คู่เข้าเงื่อนไข แต่ยังไม่เปิด: {reason}", level="warn", phase="blocked")
