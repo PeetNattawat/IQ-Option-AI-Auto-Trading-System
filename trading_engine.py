@@ -472,6 +472,9 @@ class TradeManager:
         self._live_active_names = {}
         # Cached bucket win-rates; rebuilt each time execute_trade is called (cheap at <1k trades)
         self._bucket_cache: dict = {}
+        # Hard expiry lock: epoch time before which NO new auto trade is allowed.
+        # Independent of active_orders — survives API quirks that prematurely clear a position.
+        self._auto_locked_until: float = 0.0
 
     def resolve_active_name(self, active_id) -> str:
         """Best-effort active_id -> readable pair name. Tries the live map, then the
@@ -553,6 +556,11 @@ class TradeManager:
 
     def can_trade(self) -> tuple[bool, str]:
         now = time.time()
+        # Hard expiry lock — blocks new entries until the last auto trade's expiry has passed.
+        # Survives API quirks that prematurely remove a trade from active_orders.
+        if now < self._auto_locked_until:
+            remaining = int((self._auto_locked_until - now) / 60) + 1
+            return False, f"รอไม้ล่าสุดหมดอายุก่อน (~{remaining} นาที)"
         # Clear old hourly records
         while self.hourly_trades and now - self.hourly_trades[0] > 3600:
             self.hourly_trades.popleft()
@@ -654,6 +662,12 @@ class TradeManager:
             self.active_orders[order_id] = trade
             self.trades.append(trade)
             self.hourly_trades.append(time.time())
+            # Set hard expiry lock when this is an auto trade.
+            # Prevents a new auto entry until expiry + 60s buffer,
+            # even if active_orders is cleared early by an API quirk.
+            if meta.get("source") == "auto":
+                self._auto_locked_until = time.time() + (duration * 60) + 60
+                logger.info(f"[LOCK] Auto trade lock set — ไม่เปิดไม้ใหม่จนกว่าจะครบ {duration} นาที (+60s buffer)")
             self._save_trades()
             logger.info(f"[TRADE] Order placed: ID {order_id}")
             return trade
