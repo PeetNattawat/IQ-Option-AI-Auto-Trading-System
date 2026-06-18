@@ -246,7 +246,7 @@ class FullTradingBot(TradingBot):
             top_reason = (signal.reasons or ["-"])[0]
             logger.info(
                 f"[SIGNAL] {asset}: {signal.signal:4s} | Conf: {signal.confidence:5.1f}% | "
-                f"RSI: {signal.rsi:5.1f} | ATR: {signal.atr:.5f} | ADX: {signal.adx:.1f} | "
+                f"RSI: {signal.rsi:5.1f} | ATR: {signal.atr:.5f} | "
                 f"{decision} — {top_reason}"
             )
 
