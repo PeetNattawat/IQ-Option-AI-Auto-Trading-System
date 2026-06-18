@@ -407,7 +407,6 @@ class SignalEngine:
 
         # passed — annotate quality
         reasons.append(f"ATR {atr_pct*100:.4f}% ✅ ผ่าน gate [{self.cfg.atr_floor_pct*100:.4f}%–{self.cfg.atr_ceiling_pct*100:.4f}%]")
-        reasons.append(f"ADX {adx:.1f} (info)")
         if vol_high: reasons.append("Volume สูงกว่าค่าเฉลี่ย — ยืนยันแรงซื้อขาย")
 
         return SignalResult(
