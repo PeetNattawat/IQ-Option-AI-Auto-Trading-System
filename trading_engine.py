@@ -666,8 +666,10 @@ class TradeManager:
             # Prevents a new auto entry until expiry + 60s buffer,
             # even if active_orders is cleared early by an API quirk.
             if meta.get("source") == "auto":
-                self._auto_locked_until = time.time() + (duration * 60) + 60
-                logger.info(f"[LOCK] Auto trade lock set — ไม่เปิดไม้ใหม่จนกว่าจะครบ {duration} นาที (+60s buffer)")
+                # Buffer 5 min accounts for IQ Option's quarter-hour snap (:00/:15/:30/:45)
+                # which can make the actual expiry up to ~15 min later than placement time.
+                self._auto_locked_until = time.time() + (duration * 60) + 300
+                logger.info(f"[LOCK] Auto trade lock set — ไม่เปิดไม้ใหม่จนกว่าจะครบ {duration} นาที (+5 นาที buffer)")
             self._save_trades()
             logger.info(f"[TRADE] Order placed: ID {order_id}")
             return trade
@@ -814,6 +816,9 @@ class TradeManager:
             elif trade["result"] == "WIN":
                 self.consecutive_losses = 0
             self._advance_martingale(trade["asset"], trade["result"])
+            # Release expiry lock immediately — result is confirmed, next trade can enter now
+            self._auto_locked_until = 0.0
+            logger.info(f"[LOCK] ปลด lock แล้ว — {trade['asset']} ปิดด้วย {trade['result']}")
         logger.info(f"[RESULT] {trade['asset']} {trade['direction']} -> {trade['result']} | PnL: {pnl:+.2f}")
         self.pending_alerts.append(trade)
 
