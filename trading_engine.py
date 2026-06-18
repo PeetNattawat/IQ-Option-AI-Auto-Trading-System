@@ -464,9 +464,8 @@ class TradeManager:
         # snapshot-diff approach missed alerts when run_cycle resolved a trade before the
         # 15s loop's old_results snapshot was taken.
         self.pending_alerts = []  # list of closed trade dicts awaiting a Telegram alert
-        # Per-asset Martingale ladder: each pair recovers its own losses independently,
-        # so up to max_open_positions pairs can run concurrent ladders.
-        self.asset_step = {}  # asset -> 0-indexed current step (0 = base stake)
+        # Per-asset Martingale ladder: persisted to disk so restart doesn't reset mid-recovery.
+        self.asset_step = self._load_asset_step()
         # Live active_id -> name map (filled by resolve_assets from get_all_init_v2),
         # so platform-opened trades show real pair names even for new ids the static table lacks.
         self._live_active_names = {}
@@ -506,6 +505,20 @@ class TradeManager:
                 return json.load(f)
         except FileNotFoundError:
             return []
+
+    def _load_asset_step(self) -> dict:
+        try:
+            with open("data/martingale_state.json") as f:
+                data = json.load(f)
+                logger.info(f"[MARTINGALE] Loaded ladder state: {data}")
+                return {k: int(v) for k, v in data.items()}
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_asset_step(self):
+        os.makedirs("data", exist_ok=True)
+        with open("data/martingale_state.json", "w") as f:
+            json.dump(self.asset_step, f, indent=2)
 
     def today_trades(self) -> list:
         today = datetime.now().date().isoformat()
@@ -547,6 +560,7 @@ class TradeManager:
                 logger.info(f"[MARTINGALE] {asset}: win — reset ladder to base")
             self.asset_step[asset] = 0
         # EQUAL: keep the same step (stake returned, no progression)
+        self._save_asset_step()
 
     def open_auto_count(self) -> int:
         return sum(1 for t in self.active_orders.values() if t.get("source") == "auto")
