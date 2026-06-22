@@ -486,13 +486,13 @@ class FullTradingBot(TradingBot):
         bot, man = t.get("bot", {}), t.get("manual", {})
         return (
             f"📊 <b>สรุปวันนี้</b>\n\n"
-            f"💰 กำไร/ขาดทุน: <b>{sign}{pnl:.2f}</b>\n"
+            f"💰 กำไร/ขาดทุน: <b>{sign}{pnl:.2f} บาท</b>\n"
             f"📈 เทรด: <b>{t.get('total', 0)}</b> ไม้ "
             f"(ชนะ {t.get('wins', 0)} / แพ้ {t.get('losses', 0)} / เสมอ {t.get('equals', 0)})\n"
-            f"🎯 winrate: <b>{t.get('win_rate', 0)}%</b>\n"
-            f"🤖 Bot: {bot.get('wins',0)}W/{bot.get('losses',0)}L · "
-            f"✋ Manual: {man.get('wins',0)}W/{man.get('losses',0)}L\n"
-            f"💵 balance: <b>{state_store.get('balance', 0):,.2f}</b>\n"
+            f"🎯 อัตราชนะ: <b>{t.get('win_rate', 0)}%</b>\n"
+            f"🤖 บอท: ชนะ {bot.get('wins',0)} / แพ้ {bot.get('losses',0)} · "
+            f"✋ มือ: ชนะ {man.get('wins',0)} / แพ้ {man.get('losses',0)}\n"
+            f"💵 ยอดเงิน: <b>฿{state_store.get('balance', 0):,.2f}</b>\n"
             f"🕐 {datetime.now().strftime('%H:%M:%S')}"
         )
 
@@ -553,15 +553,29 @@ class FullTradingBot(TradingBot):
     def _tg_status_text(self) -> str:
         r = self.build_risk()
         act = (state_store.get("activity") or {}).get("msg", "-")
-        status = "หยุดอยู่ (paused)" if self._paused else state_store.get("status", "-")
+        raw_status = state_store.get("status", "-")
+        _status_map = {
+            "running": "🟢 กำลังทำงาน",
+            "stopped": "⏹ หยุดอยู่",
+            "reconnecting": "🔄 กำลังเชื่อมต่อใหม่",
+            "paused": "⏸ หยุดชั่วคราว",
+            "connection_failed": "❌ เชื่อมต่อล้มเหลว",
+        }
+        if self._paused:
+            status = "⏸ หยุดชั่วคราว"
+        elif raw_status.startswith("error"):
+            err_detail = raw_status[6:].strip() if len(raw_status) > 5 else ""
+            status = f"❌ ผิดพลาด{': ' + err_detail if err_detail else ''}"
+        else:
+            status = _status_map.get(raw_status, raw_status)
         return (
             f"🤖 <b>สถานะบอท</b>\n\n"
             f"สถานะ: <b>{status}</b>\n"
             f"บัญชี: <b>{self.cfg.account_type}</b>\n"
-            f"💵 balance: <b>{state_store.get('balance', 0):,.2f}</b>\n"
+            f"💵 ยอดเงิน: <b>฿{state_store.get('balance', 0):,.2f}</b>\n"
             f"ไม้เปิดอยู่: {r.get('open',0)}/{r.get('max_open',3)} · "
             f"เทรดวันนี้: {r.get('today_trades',0)}\n"
-            f"กำไรวันนี้: {r.get('daily_pnl',0):+.2f}\n"
+            f"กำไรวันนี้: {r.get('daily_pnl',0):+.2f} บาท\n"
             f"กำลัง: {act}\n"
             f"🕐 {datetime.now().strftime('%H:%M:%S')}"
         )
@@ -744,7 +758,7 @@ class FullTradingBot(TradingBot):
                 await self.run_cycle()
             except Exception as e:
                 logger.error(f"[LOOP] {e}", exc_info=True)
-                state_store["status"] = f"error"
+                state_store["status"] = f"error: {e}"
             # Sleep until just after the next candle closes, so each cycle acts on a freshly
             # closed candle (not at an arbitrary offset within the candle).
             tf = self.cfg.timeframe

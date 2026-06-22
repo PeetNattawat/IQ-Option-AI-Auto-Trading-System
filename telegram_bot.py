@@ -102,7 +102,7 @@ class TelegramBot:
             f"💼 บัญชี: <b>{acc}</b>\n"
             f"📈 คู่เงิน: <b>{len(assets)} คู่</b>\n"
             f"⏱ ไทม์เฟรม: <b>{self._tf_label(timeframe)}</b> · หมดอายุ {timeframe // 60} นาที\n"
-            f"💵 เงินต่อไม้: <b>${trade_amount:.0f}</b>\n"
+            f"💵 เงินต่อไม้: <b>฿{trade_amount:.0f}</b>\n"
             f"🎯 เข้าเทรดเมื่อมั่นใจ ≥ <b>{confidence_threshold:.0f}%</b>\n"
             f"\n"
             f"🕐 {self._now()}"
@@ -128,7 +128,7 @@ class TelegramBot:
         wins, losses = today.get("wins", 0), today.get("losses", 0)
         pnl = today.get("pnl", 0) or 0
         sign = "+" if pnl >= 0 else ""
-        return f"📊 วันนี้: {wins}W / {losses}L · {sign}{pnl:.2f} USD\n"
+        return f"📊 วันนี้: {wins}ชนะ / {losses}แพ้ · {sign}{pnl:.2f} บาท\n"
 
     # ─────────────────────────────────────────
     #  2) ORDER PLACED (with decision reasons)
@@ -162,7 +162,7 @@ class TelegramBot:
             f"🚀 <b>ออกออเดอร์ {self._dir_label(direction)}</b>\n"
             f"\n"
             f"📌 คู่เงิน: <b>{self._pretty_asset(trade.get('asset'))}</b>\n"
-            f"💵 ลงทุน: <b>${trade.get('amount', 0):.0f}</b>\n"
+            f"💵 ลงทุน: <b>฿{trade.get('amount', 0):.0f}</b>\n"
             f"{mg_line}"
             f"{conf_line}"
             f"⏱ หมดอายุ: <b>{trade.get('expiry', '?')} นาที</b>\n"
@@ -200,7 +200,7 @@ class TelegramBot:
             f"\n"
             f"📌 <b>{self._pretty_asset(trade.get('asset'))}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
-            f"💵 ลงทุน ${amount:.0f} → <b>{sign}{pnl:.2f} USD</b>\n"
+            f"💵 ลงทุน ฿{amount:.0f} → <b>{sign}{pnl:.2f} บาท</b>\n"
             f"{mg_line}"
             f"{conf_line}"
             f"{summary_line}"

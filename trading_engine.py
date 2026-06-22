@@ -85,9 +85,8 @@ class TradingConfig:
     volume_multiplier: float = 1.2  # Volume must be > avg * multiplier
 
     # Direction filters (anti-chop / anti-bias)
-    adx_min: float = 25.0        # 22 -> 28 (overhaul) -> 25: 28 filtered out nearly all entries on
-                                 # ranging days (e.g. 16 Jun: many ADX<28 setups held). 25 still needs
-                                 # a developing trend but unlocks borderline 25-28 setups.
+    adx_min: float = 28.0        # raised back to 28: requires a developing trend and filters choppy
+                                 # low-ADX setups that were losing Martingale recovery stakes.
     dir_margin: float = 30.0     # was 15 — dominant side must beat the other by this many points (item 4)
 
     # Trade settings
@@ -388,6 +387,8 @@ class SignalEngine:
 
         # 2) hard filters — any failure => HOLD
         gates = []
+        if not adx_ok:
+            gates.append(f"ADX {adx:.1f} < {self.cfg.adx_min:.0f} — เทรนด์ไม่แรงพอ ไม่เทรด")
         if margin < self.cfg.dir_margin:
             gates.append(f"ทิศไม่ชัด (นำแค่ {margin} แต้ม)")
         if confidence < self.cfg.confidence_threshold:
