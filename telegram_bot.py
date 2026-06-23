@@ -192,8 +192,14 @@ class TelegramBot:
         conf_line = f"🎯 ความมั่นใจ: {conf:.0f}%\n" if conf is not None else ""
         mg_line = f"🎲 ไม้ทบ: สเต็ป {trade['mg_step']}\n" if trade.get("mg_step") else ""
 
-        summary = self._today_line(today)
-        summary_line = f"\n📈 สรุป{summary[3:]}" if summary else ""
+        # Build a clear "สรุปวันนี้" line directly from `today` to avoid slicing issues
+        if today:
+            wins, losses = today.get("wins", 0), today.get("losses", 0)
+            pnl = today.get("pnl", 0) or 0
+            sign = "+" if pnl >= 0 else ""
+            summary_line = f"\n📈 สรุปวันนี้: {wins}ชนะ / {losses}แพ้ · {sign}{pnl:.2f} บาท\n"
+        else:
+            summary_line = ""
 
         text = (
             f"{head}\n"
