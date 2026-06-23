@@ -465,8 +465,9 @@ class TradeManager:
         # snapshot-diff approach missed alerts when run_cycle resolved a trade before the
         # 15s loop's old_results snapshot was taken.
         self.pending_alerts = []  # list of closed trade dicts awaiting a Telegram alert
-        # Per-asset Martingale ladder: persisted to disk so restart doesn't reset mid-recovery.
-        self.asset_step = self._load_asset_step()
+        # Global Martingale ladder: one shared step counter across all assets.
+        # Persisted to disk so restart doesn't reset mid-recovery.
+        self.current_step: int = self._load_step()
         # Live active_id -> name map (filled by resolve_assets from get_all_init_v2),
         # so platform-opened trades show real pair names even for new ids the static table lacks.
         self._live_active_names = {}
@@ -507,19 +508,28 @@ class TradeManager:
         except FileNotFoundError:
             return []
 
-    def _load_asset_step(self) -> dict:
+    def _load_step(self) -> int:
         try:
             with open("data/martingale_state.json") as f:
                 data = json.load(f)
-                logger.info(f"[MARTINGALE] Loaded ladder state: {data}")
-                return {k: int(v) for k, v in data.items()}
+                # New format: {"step": N}
+                if "step" in data:
+                    step = int(data["step"])
+                    logger.info(f"[MARTINGALE] Loaded global step: {step}")
+                    return step
+                # Legacy per-asset format: {"EURUSD": 1, ...} — take the max active step
+                if isinstance(data, dict) and data:
+                    step = max(int(v) for v in data.values())
+                    logger.info(f"[MARTINGALE] Migrated legacy per-asset state → global step: {step}")
+                    return step
         except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+            pass
+        return 0
 
-    def _save_asset_step(self):
+    def _save_step(self):
         os.makedirs("data", exist_ok=True)
         with open("data/martingale_state.json", "w") as f:
-            json.dump(self.asset_step, f, indent=2)
+            json.dump({"step": self.current_step}, f, indent=2)
 
     def today_trades(self) -> list:
         today = datetime.now().date().isoformat()
@@ -528,40 +538,40 @@ class TradeManager:
     def today_pnl(self) -> float:
         return round(sum(t.get("pnl") or 0 for t in self.today_trades() if t.get("status") == "closed"), 2)
 
-    # ── Martingale (BOT/auto trades only) ──
+    # ── Martingale (BOT/auto trades only) — global single ladder ──
     def martingale_sequence(self) -> list:
         base, mult, steps = self.cfg.martingale_base, self.cfg.martingale_multiplier, self.cfg.martingale_max_steps
         return [round(base * (mult ** i), 2) for i in range(steps)]
 
-    def next_auto_stake(self, asset: str) -> float:
-        """Stake for the next bot trade on this asset.
-        When martingale is OFF (default), always returns the flat base stake (trade_amount).
-        When ON, returns the current ladder step amount for this asset."""
+    def next_auto_stake(self, asset: str = "") -> float:
+        """Stake for the next bot trade.
+        When martingale is OFF, always returns the flat base stake (trade_amount).
+        When ON, returns the current global ladder step amount."""
         if not self.cfg.martingale_enabled:
             return self.cfg.trade_amount
         seq = self.martingale_sequence()
-        step = min(self.asset_step.get(asset, 0), len(seq) - 1)
+        step = min(self.current_step, len(seq) - 1)
         return seq[step]
 
     def _advance_martingale(self, asset: str, result: str):
-        """After a BOT trade closes: climb that asset's ladder on loss, reset on win.
+        """After a BOT trade closes: advance global ladder on loss, reset on win.
         Reaching the final step then losing resets to base (accept the drawdown).
         No-op when martingale is disabled."""
         if not self.cfg.martingale_enabled:
             return
-        step = self.asset_step.get(asset, 0)
         if result == "LOSS":
-            step += 1
-            if step >= self.cfg.martingale_max_steps:
+            self.current_step += 1
+            if self.current_step >= self.cfg.martingale_max_steps:
                 logger.warning(f"[MARTINGALE] {asset}: final step lost — reset ladder to base")
-                step = 0
-            self.asset_step[asset] = step
+                self.current_step = 0
+            else:
+                logger.info(f"[MARTINGALE] {asset}: loss — step → {self.current_step + 1}/{self.cfg.martingale_max_steps}")
         elif result == "WIN":
-            if step:
+            if self.current_step:
                 logger.info(f"[MARTINGALE] {asset}: win — reset ladder to base")
-            self.asset_step[asset] = 0
+            self.current_step = 0
         # EQUAL: keep the same step (stake returned, no progression)
-        self._save_asset_step()
+        self._save_step()
 
     def open_auto_count(self) -> int:
         return sum(1 for t in self.active_orders.values() if t.get("source") == "auto")
@@ -711,9 +721,9 @@ class TradeManager:
             logger.warning(f"[BUCKET-VETO] {bucket_reason}")
             return None
 
-        step = self.asset_step.get(signal.asset, 0)
+        step = self.current_step
         stake = self.next_auto_stake(signal.asset)
-        step_info = (f" | {signal.asset} Martingale step {step + 1}/{self.cfg.martingale_max_steps}"
+        step_info = (f" | Martingale step {step + 1}/{self.cfg.martingale_max_steps}"
                      if self.cfg.martingale_enabled else "")
         logger.info(f"[TRADE] Auto stake {stake}{step_info}")
         return self._place_order(signal.asset, signal.signal, stake, {
@@ -973,9 +983,8 @@ class TradeManager:
             "max_steps": self.cfg.martingale_max_steps,
             "sequence": self.martingale_sequence(),
             "base": self.cfg.martingale_base,
-            "max_lanes": self.cfg.max_open_positions,
-            # assets currently mid-recovery (step > 0): asset -> step number (1-indexed)
-            "active": {a: s + 1 for a, s in self.asset_step.items() if s > 0},
+            "current_step": self.current_step + 1,  # 1-indexed for display
+            "next_stake": self.next_auto_stake(),
         }
         return stats
 

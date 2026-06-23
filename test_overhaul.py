@@ -65,7 +65,7 @@ cfg_flat = TradingConfig(martingale_enabled=False, trade_amount=50.0, martingale
 # Mimic TradeManager methods without connecting to IQ
 tm = object.__new__(TradeManager)
 tm.cfg = cfg_flat
-tm.asset_step = {}
+tm.current_step = 0
 
 # Step 0 — flat
 s0 = tm.next_auto_stake("EURUSD")
@@ -81,12 +81,12 @@ tm._advance_martingale("EURUSD", "LOSS")
 s3 = tm.next_auto_stake("EURUSD")
 check("stake after 3 losses still 50", s3 == 50.0, f"got {s3}")
 
-# Sanity: with martingale ON the ladder WOULD progress
+# Sanity: with martingale ON the ladder WOULD progress (global step)
 cfg_mg = TradingConfig(martingale_enabled=True, martingale_base=50.0,
                        martingale_multiplier=2.0, martingale_max_steps=4)
 tm2 = object.__new__(TradeManager)
 tm2.cfg = cfg_mg
-tm2.asset_step = {}
+tm2.current_step = 0
 tm2._advance_martingale("EURUSD", "LOSS")
 s_mg = tm2.next_auto_stake("EURUSD")
 check("martingale ON step 1 gives 100", s_mg == 100.0, f"got {s_mg}")
