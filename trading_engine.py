@@ -1041,7 +1041,17 @@ class LearningEngine:
                 })
 
         # High performance patterns
-        high_conf = [t for t in closed if t.get("confidence", 0) >= 80]
+        high_conf = []
+        for t in closed:
+            conf = t.get("confidence")
+            if conf is None:
+                continue
+            try:
+                conf_val = float(conf)
+            except (TypeError, ValueError):
+                continue
+            if conf_val >= 80:
+                high_conf.append(t)
         if high_conf:
             hc_wins = sum(1 for t in high_conf if t.get("result") == "WIN")
             hc_wr = hc_wins / len(high_conf)
