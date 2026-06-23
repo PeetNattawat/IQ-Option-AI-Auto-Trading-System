@@ -89,8 +89,8 @@ def apply_runtime_config(cfg: TradingConfig, rt: dict):
     if cfg.martingale_enabled:
         cfg.trade_amount = cfg.martingale_base
         cfg.max_consecutive_losses = max(cfg.max_consecutive_losses, cfg.martingale_max_steps)
-        # up to max_open_positions concurrent per-asset ladders (don't force to 1)
-        cfg.max_open_positions = max(1, cfg.max_open_positions)
+        # Global single Martingale ladder — only 1 auto trade at a time
+        cfg.max_open_positions = 1
 
 
 # ─────────────────────────────────────────────────
@@ -277,10 +277,11 @@ class FullTradingBot(TradingBot):
         for signal in candidates:
             if in_cooldown:
                 break
-            # Re-query active_orders live every iteration so a trade placed moments ago
-            # (or resolved by external_sync_loop) is immediately reflected.
-            open_now = len(self.trade_manager.active_orders)
-            if open_now >= self.cfg.max_open_positions:
+            # Re-query active_orders and expiry lock live — covers trades placed moments ago
+            # or closed by external_sync_loop between iterations.
+            if len(self.trade_manager.active_orders) >= self.cfg.max_open_positions:
+                break
+            if time.time() < self.trade_manager._auto_locked_until:
                 break
             trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
             if trade:
@@ -290,7 +291,8 @@ class FullTradingBot(TradingBot):
                 asyncio.create_task(self.tg.alert_trade_open(trade))
                 mg = f" · ไม้ {trade.get('mg_step')}" if trade.get("mg_step") else ""
                 self.log_activity("🚀", f"เปิดออเดอร์ {trade['asset']} {trade['direction']} ที่ {(trade.get('confidence') or 0):.0f}%{mg}", phase="trading")
-                break  # ออกทันที — รอปิดไม้นี้ก่อนจึงจะเปิดถัดไป
+            # Always stop after one attempt — even if broker rejected, don't try the next signal
+            break
 
         # Summarize the decision so the dashboard shows what the bot is doing / waiting for
         best = max(signals_this_cycle, key=lambda s: s.get("confidence") or 0, default=None)
@@ -442,7 +444,7 @@ class FullTradingBot(TradingBot):
             if "martingale_max_steps" in settings:
                 settings["martingale_max_steps"] = max(1, min(8, int(settings["martingale_max_steps"])))
             if "max_open_positions" in settings:
-                settings["max_open_positions"] = max(1, min(3, int(settings["max_open_positions"])))
+                settings["max_open_positions"] = 1  # always 1: global single Martingale ladder
             apply_runtime_config(self.cfg, settings)
             save_runtime_config(self.cfg)
             logger.info(f"[CMD] Settings updated: {', '.join(settings.keys())}")

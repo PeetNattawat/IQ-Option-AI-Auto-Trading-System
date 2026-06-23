@@ -595,8 +595,6 @@ class TradeManager:
             return False, f"Consecutive losses {self.consecutive_losses} — cooling down"
         if len(self.active_orders) >= self.cfg.max_open_positions:
             return False, f"Max {self.cfg.max_open_positions} open positions reached"
-        if len(self.today_trades()) >= self.cfg.max_trades_per_day:
-            return False, f"Max {self.cfg.max_trades_per_day} trades/day reached"
         if self.cfg.daily_loss_limit > 0 and -self.today_pnl() >= self.cfg.daily_loss_limit:
             return False, f"Daily loss limit {self.cfg.daily_loss_limit} reached"
         return True, "OK"
