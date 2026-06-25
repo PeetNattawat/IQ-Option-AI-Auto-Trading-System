@@ -118,6 +118,7 @@ class TradingConfig:
     max_assets: int = 12                # cap when auto-discovering
     trade_otc: bool = False             # NEVER trade OTC (synthetic) pairs — real forex only
     trade_digital: bool = True          # also scan/trade DIGITAL options — real forex usually lives here
+    digital_only: bool = True           # skip pairs not on the digital list (no binary/turbo fallback)
     min_payout: float = 0.70            # only trade pairs paying at least this (e.g. 0.70 = 70%)
 
     def __post_init__(self):
@@ -644,7 +645,7 @@ class TradeManager:
         Routes to digital-spot for assets resolved as 'digital' (real forex usually trades
         only on digital), otherwise to the binary endpoint.
         Persists adx_band and rsi_band for bucket analysis (item 7)."""
-        kind = (getattr(self.cfg, "asset_kind", None) or {}).get(asset, "binary")
+        kind = (getattr(self.cfg, "asset_kind", None) or {}).get(asset, "digital")
         action = "call" if direction.upper() == "CALL" else "put"
         duration = self.cfg.expiry_minutes
         logger.info(f"[TRADE] Placing {action.upper()} on {asset} [{kind}] | amount {amount} | source {meta.get('source')}")
@@ -1289,6 +1290,10 @@ class TradingBot:
             logger.info(f"[ASSET] Synced {repatched} live active ids into the name->id table")
 
         open_real = sorted(open_kind)
+        if self.cfg.digital_only:
+            open_real = [n for n in open_real if open_kind.get(n) == "digital"]
+            if not open_real:
+                logger.warning("[ASSET] digital_only=True but no digital pairs open — all filtered out")
         logger.info(f"[ASSET] open real-FX: {open_real or 'none'} "
                     f"(digital: {sorted(digital_open) or 'none'}) | OTC open: {otc_count}")
 
