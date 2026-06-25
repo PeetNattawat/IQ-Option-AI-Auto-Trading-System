@@ -1191,6 +1191,8 @@ class TradingBot:
         # Fiat-currency whitelist: IQ-tradeable majors covering all real forex crosses.
         # Excludes crypto (BTC/ETH), gold (XAU), silver (XAG), oil (USO), etc. by construction.
         FIAT = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
+        # Extra non-FIAT pairs explicitly allowed (gold, crypto).
+        EXTRA_PAIRS = {"XAUUSD", "BTCUSD"}
 
         def is_fx(name):
             # real (non-OTC) FIAT forex only. IQ names the REAL binary/turbo option "XXXXXX-op",
@@ -1200,6 +1202,8 @@ class TradingBot:
             if name.endswith("-OTC"):              # never trade OTC (synthetic) pairs
                 return False
             base = name[:-3] if name.endswith("-op") else name
+            if base in EXTRA_PAIRS:                # allow gold and crypto
+                return True
             return len(base) == 6 and base[:3] in FIAT and base[3:] in FIAT
 
         open_kind = {}        # name -> "digital" | "binary" | "turbo"  (digital preferred for real FX)
