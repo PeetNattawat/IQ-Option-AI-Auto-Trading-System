@@ -185,9 +185,10 @@ class TelegramBot:
                 "LOSS": "❌ <b>ผล: แพ้</b>",
                 "EQUAL": "➖ <b>ผล: เสมอ</b> (คืนทุน)"}.get(result, "<b>ผล: ?</b>")
 
-        pnl = trade.get("pnl", 0) or 0
+        trade_pnl = trade.get("pnl", 0) or 0
         amount = trade.get("amount", 0) or 0
-        sign = "+" if pnl >= 0 else ""
+        trade_sign = "+" if trade_pnl >= 0 else ""
+        pnl_label = "กำไร" if trade_pnl >= 0 else "ขาดทุน"
         conf = trade.get("confidence")
         conf_line = f"🎯 ความมั่นใจ: {conf:.0f}%\n" if conf is not None else ""
         mg_line = f"🎲 ไม้ทบ: สเต็ป {trade['mg_step']}\n" if trade.get("mg_step") else ""
@@ -195,9 +196,9 @@ class TelegramBot:
         # Build a clear "สรุปวันนี้" line directly from `today` to avoid slicing issues
         if today:
             wins, losses = today.get("wins", 0), today.get("losses", 0)
-            pnl = today.get("pnl", 0) or 0
-            sign = "+" if pnl >= 0 else ""
-            summary_line = f"\n📈 สรุปวันนี้: {wins}ชนะ / {losses}แพ้ · {sign}{pnl:.2f} บาท\n"
+            day_pnl = today.get("pnl", 0) or 0
+            day_sign = "+" if day_pnl >= 0 else ""
+            summary_line = f"\n📈 สรุปวันนี้: {wins}ชนะ / {losses}แพ้ · {day_sign}{day_pnl:.2f} บาท\n"
         else:
             summary_line = ""
 
@@ -206,7 +207,7 @@ class TelegramBot:
             f"\n"
             f"📌 <b>{self._pretty_asset(trade.get('asset'))}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
-            f"💵 ลงทุน ฿{amount:.0f} → <b>{sign}{pnl:.2f} บาท</b>\n"
+            f"💰 ลงทุน ฿{amount:.0f} · {pnl_label} <b>{trade_sign}{trade_pnl:.2f} บาท</b>\n"
             f"{mg_line}"
             f"{conf_line}"
             f"{summary_line}"
