@@ -650,10 +650,17 @@ class TradeManager:
         duration = self.cfg.expiry_minutes
         logger.info(f"[TRADE] Placing {action.upper()} on {asset} [{kind}] | amount {amount} | source {meta.get('source')}")
         try:
-            if kind == "digital":
-                check, order_id = self.iq.buy_digital_spot(asset, amount, action, duration)
-            else:
-                check, order_id = self.iq.buy(amount, asset, action, duration)
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                if kind == "digital":
+                    _fut = _ex.submit(self.iq.buy_digital_spot, asset, amount, action, duration)
+                else:
+                    _fut = _ex.submit(self.iq.buy, amount, asset, action, duration)
+                try:
+                    check, order_id = _fut.result(timeout=30)
+                except _cf.TimeoutError:
+                    logger.error(f"[TRADE] TIMEOUT placing {asset} [{kind}] after 30s — skipping")
+                    return None
             if not check:
                 logger.error(f"[TRADE] Order failed for {asset} [{kind}] (broker rejected: {order_id})")
                 return None
