@@ -1294,6 +1294,24 @@ class TradingBot:
             logger.info(f"[ASSET] Synced {repatched} live active ids into the name->id table")
 
         open_real = sorted(open_kind)
+
+        # ── MANUAL mode: use cfg.assets as universe instead of full API discovery ──
+        if not self.cfg.auto_discover_assets and self.cfg.assets:
+            manual = self.cfg.assets  # user-specified list
+            # keep only pairs confirmed open by API (present in open_kind)
+            open_manual = [a for a in manual if a in open_kind]
+            if not open_manual:
+                # fallback: none of the manual pairs found open — use full discovered list
+                logger.warning(
+                    "[ASSET] Manual list: none of the specified pairs found open "
+                    "— falling back to auto-discovered list"
+                )
+            else:
+                open_real = open_manual
+                logger.info(
+                    f"[ASSET] Manual mode: {len(open_manual)}/{len(manual)} pairs confirmed open: {open_manual}"
+                )
+
         if self.cfg.digital_only:
             open_real = [n for n in open_real if open_kind.get(n) == "digital"]
             if not open_real:
