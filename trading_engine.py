@@ -46,6 +46,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Assets that cannot be traded as digital spot (IQ Option blocks them at the instrument level)
+_DIGITAL_SPOT_UNSUPPORTED = frozenset({"XAUUSD", "BTCUSD", "ETHUSD", "LTCUSD"})
+
 # ─────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────
@@ -1390,6 +1393,9 @@ class TradingBot:
             chosen = (filtered or ranked)[: self.cfg.max_assets]
         else:
             chosen = ranked[: self.cfg.max_assets]
+
+        # Strip assets that are not supported on digital spot (e.g. XAUUSD, BTCUSD)
+        chosen = [a for a in chosen if a.replace("-op", "").replace("-OTC", "") not in _DIGITAL_SPOT_UNSUPPORTED]
 
         if chosen != self.cfg.assets:
             label = ", ".join(f"{a}[{open_kind[a]}] {payout(a)*100:.0f}%" for a in chosen)
