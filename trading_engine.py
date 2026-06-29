@@ -656,14 +656,22 @@ class TradeManager:
         duration = self.cfg.expiry_minutes
         logger.info(f"[TRADE] Placing {action.upper()} on {asset} [{kind}] | amount {amount} | source {meta.get('source')}")
         def _attempt_buy() -> tuple:
-            """Submit a single buy call and wait up to 30s. Returns (check, order_id) or raises."""
+            """Submit a single buy call and wait up to 30s. Returns (check, order_id) or raises.
+            Does NOT use ThreadPoolExecutor as context manager — shutdown(wait=True) would block
+            forever if buy_digital_spot hangs after the timeout fires."""
             import concurrent.futures as _cf
-            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            _ex = _cf.ThreadPoolExecutor(max_workers=1)
+            try:
                 if kind == "digital":
                     _fut = _ex.submit(self.iq.buy_digital_spot, asset, amount, action, duration)
                 else:
                     _fut = _ex.submit(self.iq.buy, amount, asset, action, duration)
-                return _fut.result(timeout=30)
+                result = _fut.result(timeout=30)
+                _ex.shutdown(wait=False)
+                return result
+            except _cf.TimeoutError:
+                _ex.shutdown(wait=False)  # release immediately — hung thread runs in background
+                raise
 
         try:
             import concurrent.futures as _cf
