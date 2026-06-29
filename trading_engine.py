@@ -118,7 +118,7 @@ class TradingConfig:
     max_assets: int = 12                # cap when auto-discovering
     trade_otc: bool = False             # NEVER trade OTC (synthetic) pairs — real forex only
     trade_digital: bool = True          # also scan/trade DIGITAL options — real forex usually lives here
-    digital_only: bool = True           # skip pairs not on the digital list (no binary/turbo fallback)
+    digital_only: bool = os.getenv("DIGITAL_ONLY", "true").lower() not in ("false", "0", "no")  # skip pairs not on the digital list (no binary/turbo fallback)
     min_payout: float = 0.70            # only trade pairs paying at least this (e.g. 0.70 = 70%)
 
     def __post_init__(self):

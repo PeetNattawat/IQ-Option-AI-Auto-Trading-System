@@ -4,6 +4,7 @@ Run: python main.py
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -554,7 +555,7 @@ class FullTradingBot(TradingBot):
 
     def _tg_status_text(self) -> str:
         r = self.build_risk()
-        act = (state_store.get("activity") or {}).get("msg", "-")
+        act = html.escape((state_store.get("activity") or {}).get("msg", "-"))
         raw_status = state_store.get("status", "-")
         _status_map = {
             "running": "🟢 กำลังทำงาน",
