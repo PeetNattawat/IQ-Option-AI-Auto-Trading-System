@@ -652,17 +652,42 @@ class TradeManager:
         action = "call" if direction.upper() == "CALL" else "put"
         duration = self.cfg.expiry_minutes
         logger.info(f"[TRADE] Placing {action.upper()} on {asset} [{kind}] | amount {amount} | source {meta.get('source')}")
-        try:
+        def _attempt_buy() -> tuple:
+            """Submit a single buy call and wait up to 30s. Returns (check, order_id) or raises."""
             import concurrent.futures as _cf
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
                 if kind == "digital":
                     _fut = _ex.submit(self.iq.buy_digital_spot, asset, amount, action, duration)
                 else:
                     _fut = _ex.submit(self.iq.buy, amount, asset, action, duration)
+                return _fut.result(timeout=30)
+
+        try:
+            import concurrent.futures as _cf
+            try:
+                check, order_id = _attempt_buy()
+            except _cf.TimeoutError:
+                logger.warning(
+                    f"[TRADE] TIMEOUT placing {asset} [{kind}] after 30s — attempting reconnect and retry"
+                )
+                # Reconnect once
                 try:
-                    check, order_id = _fut.result(timeout=30)
+                    _rc, _rr = self.iq.connect()
+                    if _rc:
+                        logger.info("[TRADE] Reconnected successfully — retrying order")
+                    else:
+                        logger.error(f"[TRADE] Reconnect failed ({_rr}) — skipping {asset}")
+                        return None
+                except Exception as _re:
+                    logger.error(f"[TRADE] Reconnect error: {_re} — skipping {asset}")
+                    return None
+                # Single retry
+                try:
+                    check, order_id = _attempt_buy()
                 except _cf.TimeoutError:
-                    logger.error(f"[TRADE] TIMEOUT placing {asset} [{kind}] after 30s — skipping")
+                    logger.error(
+                        f"[TRADE] TIMEOUT on retry placing {asset} [{kind}] after 30s — skipping"
+                    )
                     return None
             if not check:
                 logger.error(f"[TRADE] Order failed for {asset} [{kind}] (broker rejected: {order_id})")
