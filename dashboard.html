@@ -95,6 +95,35 @@
   .stat-table td { font-family: var(--sans); }
   .stat-table .wr { font-family: var(--mono); font-size: 16px; font-weight: 700; }
 
+  /* STATS SUMMARY — 2-column split */
+  .stats-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 600px) { .stats-cols { grid-template-columns: 1fr; } }
+  .stats-col { background: var(--bg2); border: 1px solid var(--border2); border-radius: 10px; padding: 14px 16px; }
+  .stats-col-header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+  .stats-col-header .col-label { font-size: 13px; font-weight: 700; color: var(--text); }
+  .stats-col-header .col-count { font-family: var(--mono); font-size: 12px; color: var(--muted2); }
+  .stats-col .col-wr { font-family: var(--mono); font-size: 22px; font-weight: 700; color: var(--cyan); margin-bottom: 10px; }
+  .stats-col .col-wr.wr-low { color: var(--amber); }
+  .stats-col .col-wr.wr-bad { color: var(--red); }
+  .stats-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .stats-4-item .s4-lbl { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .stats-4-item .s4-val { font-family: var(--mono); font-size: 15px; font-weight: 700; margin-top: 2px; }
+  .stats-4-item .s4-val.win { color: var(--green); }
+  .stats-4-item .s4-val.loss { color: var(--red); }
+  .stats-4-item .s4-val.equal { color: var(--amber); }
+  .stats-4-item .s4-val.pnl-pos { color: var(--green); }
+  .stats-4-item .s4-val.pnl-neg { color: var(--red); }
+  .stats-divider { width: 1px; background: var(--border); display: none; }
+  @media (min-width: 601px) { .stats-divider { display: block; } }
+
+  /* CONNECTION STATUS */
+  .conn-status { display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--muted2); }
+  .conn-item { display: flex; align-items: center; gap: 5px; }
+  .conn-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .conn-dot.green { background: var(--green); box-shadow: 0 0 5px var(--green); }
+  .conn-dot.red { background: var(--red); }
+  .conn-dot.blink { animation: blink 1.4s infinite; }
+
   .risk-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
   @media (max-width: 700px) { .risk-grid { grid-template-columns: repeat(2, 1fr); } }
   .risk-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; }
@@ -173,6 +202,15 @@
 <div class="header">
   <h1><span class="dot"></span> IQ Option Monitor</h1>
   <div class="header-right">
+    <div class="conn-status">
+      <div class="conn-item" title="IQ Option API connection">
+        <span class="conn-dot red" id="conn-iq"></span>
+        <span id="conn-iq-label">IQ API</span>
+      </div>
+      <div class="conn-item" title="เวลาที่บอทรับข้อมูลจากโบรกเกอร์ล่าสุด">
+        <span id="conn-broker-label">โบรกเกอร์: --</span>
+      </div>
+    </div>
     <span>อัปเดต: <span id="last-update">--:--:--</span></span>
     <button class="btn-refresh" onclick="sendCmd('refresh')">รีเฟรช</button>
   </div>
@@ -236,18 +274,43 @@
     </table>
   </div>
 
-  <!-- STATS by source -->
+  <!-- STATS SUMMARY — 2-col bot vs manual -->
   <div class="card">
-    <h2>สถิติ
+    <h2>สรุปสถิติ
       <span class="seg" id="stat-period">
         <button class="active" data-p="today" onclick="setStatPeriod('today')">วันนี้</button>
-        <button data-p="all" onclick="setStatPeriod('all')">ทั้งหมด</button>
+        <button data-p="week" onclick="setStatPeriod('week')">สัปดาห์นี้</button>
+        <button data-p="month" onclick="setStatPeriod('month')">เดือนนี้</button>
       </span>
     </h2>
-    <table class="stat-table">
-      <thead><tr><th>ที่มา</th><th class="num">Winrate</th><th class="num">W</th><th class="num">L</th><th class="num">เสมอ</th><th class="num">PnL</th></tr></thead>
-      <tbody id="stats-body"></tbody>
-    </table>
+    <div class="stats-cols">
+      <div class="stats-col" id="stats-col-bot">
+        <div class="stats-col-header">
+          <span class="col-label">บอท (auto)</span>
+          <span class="col-count" id="stat-bot-total">0 ไม้</span>
+        </div>
+        <div class="col-wr" id="stat-bot-wr">0.0% winrate</div>
+        <div class="stats-4">
+          <div class="stats-4-item"><div class="s4-lbl">WIN</div><div class="s4-val win" id="stat-bot-win">0</div></div>
+          <div class="stats-4-item"><div class="s4-lbl">LOSS</div><div class="s4-val loss" id="stat-bot-loss">0</div></div>
+          <div class="stats-4-item"><div class="s4-lbl">EQUAL</div><div class="s4-val equal" id="stat-bot-equal">0</div></div>
+          <div class="stats-4-item"><div class="s4-lbl">PnL</div><div class="s4-val" id="stat-bot-pnl">0</div></div>
+        </div>
+      </div>
+      <div class="stats-col" id="stats-col-manual">
+        <div class="stats-col-header">
+          <span class="col-label">มือ (manual)</span>
+          <span class="col-count" id="stat-man-total">0 ไม้</span>
+        </div>
+        <div class="col-wr" id="stat-man-wr">0.0% winrate</div>
+        <div class="stats-4">
+          <div class="stats-4-item"><div class="s4-lbl">WIN</div><div class="s4-val win" id="stat-man-win">0</div></div>
+          <div class="stats-4-item"><div class="s4-lbl">LOSS</div><div class="s4-val loss" id="stat-man-loss">0</div></div>
+          <div class="stats-4-item"><div class="s4-lbl">EQUAL</div><div class="s4-val equal" id="stat-man-equal">0</div></div>
+          <div class="stats-4-item"><div class="s4-lbl">PnL</div><div class="s4-val" id="stat-man-pnl">0</div></div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- AI เรียนรู้จากผลเทรด -->
@@ -398,16 +461,16 @@ function addLog(cls, msg) {
 
 function connect() {
   ws = new WebSocket('ws://' + (location.hostname || 'localhost') + ':8765');
-  ws.onopen = () => { setLive(true); addLog('ok', 'เชื่อมต่อ trading engine สำเร็จ'); clearTimeout(reconnectTimer); };
+  ws.onopen = () => { setLive(true); renderConnStatus(); addLog('ok', 'เชื่อมต่อ trading engine สำเร็จ'); clearTimeout(reconnectTimer); };
   ws.onmessage = (ev) => {
     try {
       const msg = JSON.parse(ev.data);
-      if (msg.type === 'state' || msg.type === 'update') { Object.assign(S, msg.data); lastUpdateMs = Date.now(); render(); }
+      if (msg.type === 'state' || msg.type === 'update') { Object.assign(S, msg.data); lastUpdateMs = Date.now(); render(); renderConnStatus(); }
       else if (msg.type === 'new_trade') { addLog('ok', `เปิดไม้ ${msg.data.asset} ${msg.data.direction} $${msg.data.amount} (${srcLabel(msg.data.source)})`); }
       else if (msg.type === 'error') { addLog('err', msg.data.message); }
     } catch (e) {}
   };
-  ws.onclose = () => { setLive(false); addLog('err', 'หลุดการเชื่อมต่อ — ลองใหม่ใน 3 วิ...'); reconnectTimer = setTimeout(connect, 3000); };
+  ws.onclose = () => { setLive(false); renderConnStatus(); addLog('err', 'หลุดการเชื่อมต่อ — ลองใหม่ใน 3 วิ...'); reconnectTimer = setTimeout(connect, 3000); };
 }
 
 function setLive(ok) {
@@ -461,23 +524,89 @@ function setStatPeriod(p) {
   renderStats();
 }
 
-function statRow(label, b) {
+// Build a stat block from raw trades array, filtered by source
+function statBlockFromTrades(trades, source) {
+  const closed = trades.filter(t => t.status === 'closed' && (source === 'all' || (source === 'bot' ? t.source === 'auto' : t.source !== 'auto')));
+  const wins = closed.filter(t => t.result === 'WIN').length;
+  const losses = closed.filter(t => t.result === 'LOSS').length;
+  const equals = closed.filter(t => t.result === 'EQUAL').length;
+  const decided = wins + losses;
+  const pnl = closed.reduce((a, t) => a + (t.pnl || 0), 0);
+  return {
+    total: closed.length,
+    wins, losses, equals,
+    win_rate: decided ? Math.round(wins / decided * 1000) / 10 : 0,
+    pnl: Math.round(pnl * 100) / 100,
+  };
+}
+
+// Get trades filtered by period (week / month), or fall back to stats data for today
+function getStatSource() {
+  const now = new Date();
+  if (statPeriod === 'today') {
+    // prefer pre-computed server data
+    return { bot: (S.stats.today || {}).bot || {}, manual: (S.stats.today || {}).manual || {} };
+  }
+  // compute client-side from raw trades
+  const trades = S.trades || [];
+  let filtered;
+  if (statPeriod === 'week') {
+    const startOfWeek = new Date(now);
+    startOfWeek.setHours(0, 0, 0, 0);
+    startOfWeek.setDate(now.getDate() - now.getDay());  // Sunday = 0
+    filtered = trades.filter(t => t.open_time && new Date(t.open_time) >= startOfWeek);
+  } else { // month
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    filtered = trades.filter(t => t.open_time && new Date(t.open_time) >= startOfMonth);
+  }
+  return {
+    bot: statBlockFromTrades(filtered, 'bot'),
+    manual: statBlockFromTrades(filtered, 'manual'),
+  };
+}
+
+function fillStatCol(prefix, b) {
   b = b || {};
   const pnl = b.pnl ?? 0;
-  return `<tr>
-    <td>${label}</td>
-    <td class="num wr">${b.win_rate ?? 0}%</td>
-    <td class="num pnl-pos">${b.wins ?? 0}</td>
-    <td class="num pnl-neg">${b.losses ?? 0}</td>
-    <td class="num">${b.equals ?? 0}</td>
-    <td class="num ${pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${num(pnl)}</td>
-  </tr>`;
+  const wr = b.win_rate ?? 0;
+  const total = b.total ?? 0;
+  $(prefix + '-total').textContent = total + ' ไม้';
+  const wrEl = $(prefix + '-wr');
+  wrEl.textContent = wr.toFixed(1) + '% winrate';
+  wrEl.className = 'col-wr' + (wr >= 55 ? '' : wr >= 45 ? ' wr-low' : ' wr-bad');
+  $(prefix + '-win').textContent = b.wins ?? 0;
+  $(prefix + '-loss').textContent = b.losses ?? 0;
+  $(prefix + '-equal').textContent = b.equals ?? 0;
+  const pnlEl = $(prefix + '-pnl');
+  pnlEl.textContent = pnl >= 0 ? num(pnl) : num(pnl);
+  pnlEl.className = 's4-val ' + (pnl >= 0 ? 'pnl-pos' : 'pnl-neg');
 }
 
 function renderStats() {
-  const src = statPeriod === 'today' ? (S.stats.today || {}) : (S.stats || {});
-  $('stats-body').innerHTML =
-    statRow('รวม', src) + statRow('🤖 Bot', src.bot) + statRow('✋ Manual', src.manual);
+  const src = getStatSource();
+  fillStatCol('stat-bot', src.bot);
+  fillStatCol('stat-man', src.manual);
+}
+
+// Connection status render
+function renderConnStatus() {
+  const isWsConnected = ws && ws.readyState === 1;
+  const dotEl = $('conn-iq');
+  const labelEl = $('conn-iq-label');
+  if (isWsConnected) {
+    dotEl.className = 'conn-dot green blink';
+    labelEl.textContent = 'IQ API';
+  } else {
+    dotEl.className = 'conn-dot red';
+    labelEl.textContent = 'IQ API';
+  }
+  // broker last update
+  const brokerEl = $('conn-broker-label');
+  if (lastUpdateMs) {
+    brokerEl.textContent = 'โบรกเกอร์: ' + new Date(lastUpdateMs).toLocaleTimeString('th-TH');
+  } else {
+    brokerEl.textContent = 'โบรกเกอร์: --';
+  }
 }
 
 function renderActivity() {
@@ -505,7 +634,7 @@ function refreshActivityAge() {
     warn.classList.remove('show');
   }
 }
-setInterval(refreshActivityAge, 2000);
+setInterval(() => { refreshActivityAge(); renderConnStatus(); }, 2000);
 
 function renderDecisions() {
   const thr = (S.config || {}).confidence_threshold ?? 70;

@@ -837,7 +837,23 @@ class TradeManager:
         except (TypeError, ValueError):
             pnl = 0.0
         trade["pnl"] = pnl
-        trade["result"] = "WIN" if close_reason == "win" else ("EQUAL" if close_reason == "equal" else "LOSS")
+        # close_reason from IQ Option: "win" | "loose" | "equal"
+        # For external/manual trades the platform sometimes sends None or an unknown string;
+        # fall back to PnL sign so a positive return is never mislabeled LOSS.
+        if close_reason == "win":
+            trade["result"] = "WIN"
+        elif close_reason in ("equal",):
+            trade["result"] = "EQUAL"
+        elif close_reason in ("loose", "loss"):
+            trade["result"] = "LOSS"
+        else:
+            # close_reason missing or unrecognised — use PnL as ground truth
+            if pnl > 0:
+                trade["result"] = "WIN"
+            elif pnl < 0:
+                trade["result"] = "LOSS"
+            else:
+                trade["result"] = "EQUAL"
         trade["close_time"] = datetime.now().isoformat()
         trade["status"] = "closed"
         # Risk counter + Martingale ladder track BOT trades only (manual/web don't affect them)
@@ -910,7 +926,18 @@ class TradeManager:
 
                 # New trade opened outside the bot
                 asset = self.resolve_active_name(msg.get("active_id"))
-                direction = (raw.get("direction") or "").upper()
+                # IQ Option may omit 'direction' from raw_event for manual trades;
+                # fall back through: raw.direction → msg.direction → msg.option_type
+                _dir_raw = (
+                    raw.get("direction")
+                    or msg.get("direction")
+                    or msg.get("option_type")
+                    or ""
+                )
+                direction = _dir_raw.upper().replace("CALL", "CALL").replace("PUT", "PUT")
+                # Map platform aliases (e.g. "call"/"put" literal strings from option_type)
+                if direction not in ("CALL", "PUT"):
+                    direction = {"CALL": "CALL", "PUT": "PUT"}.get(direction, direction)
                 amount = float(msg.get("invest") or raw.get("amount") or 0)
                 open_ms = msg.get("open_time") or raw.get("open_time_millisecond")
                 try:
