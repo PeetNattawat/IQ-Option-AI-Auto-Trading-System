@@ -34,6 +34,7 @@ from trading_engine import (
     ws_server, broadcast, state_store, connected_clients,
 )
 from telegram_bot import TelegramBot, TelegramConfig
+from http_server import run_http_server
 
 logger = logging.getLogger(__name__)
 
@@ -886,6 +887,7 @@ async def main():
 
     await asyncio.gather(
         ws_server_full(),
+        run_http_server(),
         bot.main_loop(),
         bot.external_sync_loop(),
         bot.telegram_command_loop(),

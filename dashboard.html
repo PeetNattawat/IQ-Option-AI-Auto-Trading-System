@@ -459,8 +459,15 @@ function addLog(cls, msg) {
   while (el.children.length > 80) el.removeChild(el.lastChild);
 }
 
+// Auto-detect WebSocket URL:
+// - https: (Cloudflare Tunnel) → wss://<same hostname>/ws
+// - http:  (local dev)         → ws://localhost:8765
+const WS_URL = location.protocol === 'https:'
+  ? 'wss://' + location.hostname + '/ws'
+  : 'ws://' + (location.hostname || 'localhost') + ':8765';
+
 function connect() {
-  ws = new WebSocket('ws://' + (location.hostname || 'localhost') + ':8765');
+  ws = new WebSocket(WS_URL);
   ws.onopen = () => { setLive(true); renderConnStatus(); addLog('ok', 'เชื่อมต่อ trading engine สำเร็จ'); clearTimeout(reconnectTimer); };
   ws.onmessage = (ev) => {
     try {
