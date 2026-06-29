@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 _TF_LABEL = {60: "M1", 300: "M5", 900: "M15", 1800: "M30"}
 
 
+def _h(v) -> str:
+    """Escape a dynamic value for Telegram HTML parse_mode."""
+    return html.escape(str(v)) if v is not None else ""
+
+
 @dataclass
 class TelegramConfig:
     bot_token: str
@@ -96,12 +101,13 @@ class TelegramBot:
     async def alert_bot_start(self, *, account_type: str, assets: list, timeframe: int,
                               trade_amount: float, confidence_threshold: float) -> bool:
         acc = "🔴 REAL — เงินจริง" if account_type == "REAL" else "🟢 PRACTICE — เงินทดลอง"
+        tf_label = _h(self._tf_label(timeframe))
         text = (
             f"🟢 <b>บอทเริ่มทำงานแล้ว</b>\n"
             f"\n"
             f"💼 บัญชี: <b>{acc}</b>\n"
             f"📈 คู่เงิน: <b>{len(assets)} คู่</b>\n"
-            f"⏱ ไทม์เฟรม: <b>{self._tf_label(timeframe)}</b> · หมดอายุ {timeframe // 60} นาที\n"
+            f"⏱ ไทม์เฟรม: <b>{tf_label}</b> · หมดอายุ {timeframe // 60} นาที\n"
             f"💵 เงินต่อไม้: <b>฿{trade_amount:.0f}</b>\n"
             f"🎯 เข้าเทรดเมื่อมั่นใจ ≥ <b>{confidence_threshold:.0f}%</b>\n"
             f"\n"
@@ -158,14 +164,16 @@ class TelegramBot:
 
         mg_line = f"🎲 ไม้ทบ (Martingale): สเต็ป {trade['mg_step']}\n" if trade.get("mg_step") else ""
 
+        asset_name = _h(self._pretty_asset(trade.get('asset')))
+        expiry = _h(trade.get('expiry', '?'))
         text = (
             f"🚀 <b>ออกออเดอร์ {self._dir_label(direction)}</b>\n"
             f"\n"
-            f"📌 คู่เงิน: <b>{self._pretty_asset(trade.get('asset'))}</b>\n"
+            f"📌 คู่เงิน: <b>{asset_name}</b>\n"
             f"💵 ลงทุน: <b>฿{trade.get('amount', 0):.0f}</b>\n"
             f"{mg_line}"
             f"{conf_line}"
-            f"⏱ หมดอายุ: <b>{trade.get('expiry', '?')} นาที</b>\n"
+            f"⏱ หมดอายุ: <b>{expiry} นาที</b>\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
             f"{metric_line}"
             f"{reason_block}"
@@ -201,10 +209,11 @@ class TelegramBot:
         else:
             summary_line = ""
 
+        asset_name = _h(self._pretty_asset(trade.get('asset')))
         text = (
             f"{head}\n"
             f"\n"
-            f"📌 <b>{self._pretty_asset(trade.get('asset'))}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
+            f"📌 <b>{asset_name}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
             f"💵 ลงทุน ฿{amount:.0f} → <b>{sign}{pnl:.2f} บาท</b>\n"
             f"{mg_line}"
@@ -217,10 +226,11 @@ class TelegramBot:
     async def alert_expired(self, trade: dict) -> bool:
         """A trade that could not be resolved (IQ connection drop) and was force-expired
         to free the open-position slot. No PnL impact — informational only."""
+        asset_name = _h(self._pretty_asset(trade.get('asset')))
         text = (
             f"⏰ <b>ออเดอร์ค้าง — เคลียร์ช่องว่างแล้ว</b>\n"
             f"\n"
-            f"📌 <b>{self._pretty_asset(trade.get('asset'))}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
+            f"📌 <b>{asset_name}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
             f"⚠️ ปิดผลไม่ได้ (IQ หลุดการเชื่อมต่อ) — ปล่อยช่องให้เทรดต่อ\n"
             f"ℹ️ ไม่นับแพ้/ชนะ ไม่กระทบยอด\n"
@@ -235,7 +245,7 @@ class TelegramBot:
         text = (
             f"⚠️ <b>หยุดอัตโนมัติ (Risk)</b>\n"
             f"\n"
-            f"{reason}\n"
+            f"{_h(reason)}\n"
             f"บอทหยุดเปิดออเดอร์ใหม่แล้ว\n"
             f"\n🕐 {self._now()}"
         )
@@ -246,9 +256,9 @@ class TelegramBot:
             return False
         lines = ["🧠 <b>AI เรียนรู้และปรับกฎ</b>", ""]
         for r in result.get("disabled_rules", []):
-            lines.append(f"🚫 ปิดกฎ: {r['reason']}")
+            lines.append(f"🚫 ปิดกฎ: {_h(r['reason'])}")
         for w in result.get("warnings", []):
-            lines.append(f"⚠️ {w}")
+            lines.append(f"⚠️ {_h(w)}")
         lines.append(f"\n🕐 {self._now()}")
         return await self.send("\n".join(lines))
 

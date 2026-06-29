@@ -4,6 +4,7 @@ Run: python main.py
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -37,6 +38,11 @@ from telegram_bot import TelegramBot, TelegramConfig
 logger = logging.getLogger(__name__)
 
 RUNTIME_CONFIG_PATH = Path("data/config.json")
+
+
+def _h(v) -> str:
+    """Escape a dynamic value for Telegram HTML parse_mode."""
+    return html.escape(str(v)) if v is not None else ""
 
 
 def load_runtime_config() -> dict:
@@ -511,7 +517,8 @@ class FullTradingBot(TradingBot):
         sig_by_asset = {s["asset"]: s for s in signals}
 
         for asset in assets:
-            name = asset[:-3] if asset.endswith("-op") else asset  # drop IQ '-op' suffix for display
+            raw_name = asset[:-3] if asset.endswith("-op") else asset  # drop IQ '-op' suffix for display
+            name = _h(raw_name)
             s = sig_by_asset.get(asset)
             if not s:
                 lines.append(f"⬜ <b>{name}</b> — รอข้อมูล")
@@ -566,10 +573,10 @@ class FullTradingBot(TradingBot):
         if self._paused:
             status = "⏸ หยุดชั่วคราว"
         elif raw_status.startswith("error"):
-            err_detail = raw_status[6:].strip() if len(raw_status) > 5 else ""
+            err_detail = _h(raw_status[6:].strip()) if len(raw_status) > 5 else ""
             status = f"❌ ผิดพลาด{': ' + err_detail if err_detail else ''}"
         else:
-            status = _status_map.get(raw_status, raw_status)
+            status = _status_map.get(raw_status, _h(raw_status))
         return (
             f"🤖 <b>สถานะบอท</b>\n\n"
             f"สถานะ: <b>{status}</b>\n"
