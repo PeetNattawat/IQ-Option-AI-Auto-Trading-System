@@ -652,14 +652,14 @@ class TradeManager:
         action = "call" if direction.upper() == "CALL" else "put"
         duration = self.cfg.expiry_minutes
         logger.info(f"[TRADE] Placing {action.upper()} on {asset} [{kind}] | amount {amount} | source {meta.get('source')}")
-        def _attempt_buy() -> tuple:
+        def _attempt_buy(effective_kind: str) -> tuple:
             """Submit a single buy call and wait up to 30s. Returns (check, order_id) or raises.
             Does NOT use ThreadPoolExecutor as context manager — shutdown(wait=True) would block
             forever if buy_digital_spot hangs after the timeout fires."""
             import concurrent.futures as _cf
             _ex = _cf.ThreadPoolExecutor(max_workers=1)
             try:
-                if kind == "digital":
+                if effective_kind == "digital":
                     _fut = _ex.submit(self.iq.buy_digital_spot, asset, amount, action, duration)
                 else:
                     _fut = _ex.submit(self.iq.buy, amount, asset, action, duration)
@@ -672,37 +672,30 @@ class TradeManager:
 
         try:
             import concurrent.futures as _cf
+            effective_kind = kind
             try:
-                check, order_id = _attempt_buy()
+                check, order_id = _attempt_buy(effective_kind)
             except _cf.TimeoutError:
-                logger.warning(
-                    f"[TRADE] TIMEOUT placing {asset} [{kind}] after 30s — attempting reconnect and retry"
-                )
-                # Reconnect once
-                try:
-                    _rc, _rr = self.iq.connect()
-                    if _rc:
-                        try:
-                            self.iq.change_balance(self.cfg.account_type)
-                        except Exception:
-                            pass
-                        logger.info("[TRADE] Reconnected successfully — retrying order")
-                    else:
-                        logger.error(f"[TRADE] Reconnect failed ({_rr}) — skipping {asset}")
+                if effective_kind == "digital":
+                    logger.warning(
+                        f"[TRADE] buy_digital_spot timed out — trying turbo fallback"
+                    )
+                    effective_kind = "turbo"
+                    try:
+                        check, order_id = _attempt_buy(effective_kind)
+                        logger.info(f"[TRADE] Turbo fallback succeeded for {asset}")
+                    except _cf.TimeoutError:
+                        logger.error(
+                            f"[TRADE] TIMEOUT on turbo fallback placing {asset} after 30s — skipping"
+                        )
                         return None
-                except Exception as _re:
-                    logger.error(f"[TRADE] Reconnect error: {_re} — skipping {asset}")
-                    return None
-                # Single retry
-                try:
-                    check, order_id = _attempt_buy()
-                except _cf.TimeoutError:
+                else:
                     logger.error(
-                        f"[TRADE] TIMEOUT on retry placing {asset} [{kind}] after 30s — skipping"
+                        f"[TRADE] TIMEOUT placing {asset} [{effective_kind}] after 30s — skipping"
                     )
                     return None
             if not check:
-                logger.error(f"[TRADE] Order failed for {asset} [{kind}] (broker rejected: {order_id})")
+                logger.error(f"[TRADE] Order failed for {asset} [{effective_kind}] (broker rejected: {order_id})")
                 return None
           # fall through to record under lock
         except Exception as e:
@@ -720,7 +713,7 @@ class TradeManager:
             trade = {
                 "id": order_id,
                 "asset": asset,
-                "kind": kind,
+                "kind": effective_kind,
                 "direction": direction.upper(),
                 "amount": amount,
                 "open_time": datetime.now().isoformat(),
