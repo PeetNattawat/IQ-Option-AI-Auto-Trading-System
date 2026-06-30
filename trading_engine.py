@@ -685,6 +685,10 @@ class TradeManager:
                 try:
                     _rc, _rr = self.iq.connect()
                     if _rc:
+                        try:
+                            self.iq.change_balance(self.cfg.account_type)
+                        except Exception:
+                            pass
                         logger.info("[TRADE] Reconnected successfully — retrying order")
                     else:
                         logger.error(f"[TRADE] Reconnect failed ({_rr}) — skipping {asset}")
@@ -819,9 +823,16 @@ class TradeManager:
             instrument_types.add("binary-option")
         if any(t.get("kind") == "digital" for t in self.active_orders.values()):
             instrument_types.add("digital-option")
+        import concurrent.futures as _cf
         for itype in instrument_types:
             try:
-                check, msg = self.iq.get_position_history_v2(itype, 50, 0, 0, 0)
+                with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(self.iq.get_position_history_v2, itype, 50, 0, 0, 0)
+                    try:
+                        check, msg = fut.result(timeout=8)
+                    except _cf.TimeoutError:
+                        logger.warning(f"[RESULT] position history ({itype}) timed out — skipping")
+                        continue
                 if not check:
                     continue
                 for p in (msg or {}).get("positions", []):
