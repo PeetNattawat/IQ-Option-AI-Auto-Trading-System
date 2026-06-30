@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 # Assets that cannot be traded as digital spot (IQ Option blocks them at the instrument level)
 _DIGITAL_SPOT_UNSUPPORTED = frozenset({"XAUUSD", "BTCUSD", "ETHUSD", "LTCUSD"})
 
+# Sentinel returned by _place_order when the broker rejects an order because the pair
+# is "not available at the moment" — caller uses this to skip to the next signal
+# without counting the attempt as a loss or affecting Martingale.
+_ORDER_UNAVAILABLE = object()
+
 # ─────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────
@@ -643,8 +648,10 @@ class TradeManager:
         """Recompute bucket win-rates from trade history.  Called before each execute_trade."""
         self._bucket_cache = compute_bucket_winrates(self.trades)
 
-    def _place_order(self, asset: str, direction: str, amount: float, meta: dict) -> Optional[dict]:
+    def _place_order(self, asset: str, direction: str, amount: float, meta: dict):
         """Place an order on IQ Option and record it. direction: CALL/PUT.
+        Returns trade dict on success, _ORDER_UNAVAILABLE sentinel when the broker
+        rejects because the pair is unavailable, or None for all other failures.
         Routes to digital-spot for assets resolved as 'digital' (real forex usually trades
         only on digital), otherwise to the binary endpoint.
         Persists adx_band and rsi_band for bucket analysis (item 7)."""
@@ -714,9 +721,23 @@ class TradeManager:
                         logger.error(f"[TRADE] TIMEOUT on turbo fallback placing {asset} after 30s — skipping")
                         return None
                     if not check:
+                        _rej_msg_t = str(order_id).lower() if order_id else ""
+                        if "not available" in _rej_msg_t:
+                            logger.warning(
+                                f"[TRADE] {asset} [turbo] not available at the moment — "
+                                "will try next signal this cycle"
+                            )
+                            return _ORDER_UNAVAILABLE
                         logger.error(f"[TRADE] Order failed for {asset} [turbo] (broker rejected: {order_id})")
                         return None
                 else:
+                    _rej_msg = str(order_id).lower() if order_id else ""
+                    if "not available" in _rej_msg:
+                        logger.warning(
+                            f"[TRADE] {asset} [{effective_kind}] not available at the moment — "
+                            "will try next signal this cycle"
+                        )
+                        return _ORDER_UNAVAILABLE
                     logger.error(f"[TRADE] Order failed for {asset} [{effective_kind}] (broker rejected: {order_id})")
                     return None
           # fall through to record under lock
@@ -760,7 +781,14 @@ class TradeManager:
             logger.info(f"[TRADE] Order placed: ID {order_id}")
             return trade
 
-    def execute_trade(self, signal: SignalResult, source: str = "auto") -> Optional[dict]:
+    def execute_trade(self, signal: SignalResult, source: str = "auto"):
+        """Place an auto trade for the given signal.
+        Returns:
+          - trade dict on success
+          - _ORDER_UNAVAILABLE sentinel if the broker rejects the pair as unavailable
+            (caller should skip to next signal, no Martingale / loss counters affected)
+          - None for all other failures (risk block, veto, order error)
+        """
         can, reason = self.can_trade()
         if not can:
             logger.warning(f"[RISK] Trade blocked: {reason}")
@@ -1487,6 +1515,8 @@ class TradingBot:
         balance = self.iq.get_balance()
         state_store["balance"] = round(balance, 2)
 
+        # Pass 1: scan every asset, collect signals + candle data
+        actionable_signals: list[SignalResult] = []   # signals that pass confidence threshold
         for asset in self.cfg.assets:
             df = self.get_candles(asset)
             if df is None or len(df) < 50:
@@ -1497,17 +1527,39 @@ class TradingBot:
             signals_this_cycle.append(asdict(signal))
             logger.info(f"[SIGNAL] {asset}: {signal.signal} | Score: {signal.confidence:.1f}% | RSI: {signal.rsi:.1f}")
 
-            # Execute trade if signal is actionable
             if signal.signal in ("CALL", "PUT") and signal.confidence >= self.cfg.confidence_threshold:
-                trade = self.trade_manager.execute_trade(signal)
-                if trade:
-                    state_store["trades"] = self.trade_manager.trades
-                    await broadcast({"type": "new_trade", "data": trade})
+                actionable_signals.append(signal)
 
             # Store last candles for chart (last 50)
             state_store["candles"][asset] = df.tail(50)[["open", "high", "low", "close", "volume", "ema_fast", "ema_slow", "rsi", "atr", "macd_hist"]].to_dict("records")
 
             await asyncio.sleep(0.5)
+
+        # Pass 2: try to place exactly one trade per cycle, highest confidence first.
+        # If a pair is rejected with "not available", skip to the next one — no side
+        # effects on Martingale / consecutive_losses / hourly_trades for that attempt.
+        # Any other failure keeps existing behavior (execute_trade already handles it).
+        actionable_signals.sort(key=lambda s: s.confidence, reverse=True)
+
+        # Check global risk gates once before looping — if blocked, no pair will trade anyway.
+        can, block_reason = self.trade_manager.can_trade()
+        if not can:
+            logger.warning(f"[RISK] Trade blocked for all pairs this cycle: {block_reason}")
+        else:
+            for signal in actionable_signals:
+                result = self.trade_manager.execute_trade(signal)
+                if result is _ORDER_UNAVAILABLE:
+                    # Broker says pair unavailable — try next highest-confidence signal
+                    logger.info(
+                        f"[CYCLE] {signal.asset} unavailable — trying next signal in this cycle"
+                    )
+                    continue
+                if result is not None:
+                    # Trade placed successfully — done for this cycle
+                    state_store["trades"] = self.trade_manager.trades
+                    await broadcast({"type": "new_trade", "data": result})
+                break
+                # result is None: per-pair veto or order failure — stop; existing behavior
 
         # Check completed trades
         self.trade_manager.check_results()
