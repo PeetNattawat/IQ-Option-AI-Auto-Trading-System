@@ -661,6 +661,19 @@ class TradeManager:
             try:
                 if effective_kind == "digital":
                     active_v2 = asset.replace("-op", "").replace("-OTC", "")
+                    # Patch ACTIVES dict with live asset_id before calling v2
+                    # _live_active_names = {live_id: name} — reverse lookup to get live_id
+                    live_id = next(
+                        (k for k, v in self._live_active_names.items()
+                         if v == asset or v == active_v2),
+                        None
+                    )
+                    if live_id is not None:
+                        try:
+                            from iqoptionapi.constants import OP_code
+                            OP_code.ACTIVES[active_v2] = live_id
+                        except Exception:
+                            pass
                     _fut = _ex.submit(self.iq.buy_digital_spot_v2, active_v2, amount, action, duration)
                 else:
                     _fut = _ex.submit(self.iq.buy, amount, asset, action, duration)
