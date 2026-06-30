@@ -660,7 +660,8 @@ class TradeManager:
             _ex = _cf.ThreadPoolExecutor(max_workers=1)
             try:
                 if effective_kind == "digital":
-                    _fut = _ex.submit(self.iq.buy_digital_spot, asset, amount, action, duration)
+                    active_v2 = asset.replace("-op", "").replace("-OTC", "")
+                    _fut = _ex.submit(self.iq.buy_digital_spot_v2, active_v2, amount, action, duration)
                 else:
                     _fut = _ex.submit(self.iq.buy, amount, asset, action, duration)
                 result = _fut.result(timeout=30)
