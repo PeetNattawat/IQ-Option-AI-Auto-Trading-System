@@ -831,8 +831,13 @@ async def ws_handler_with_cmds(websocket):
 
 
 async def ws_server_full():
-    async with websockets.serve(ws_handler_with_cmds, "localhost", 8765):
-        logger.info("[WS] Dashboard at ws://localhost:8765 -> open frontend/dashboard.html")
+    async def _handler(ws):
+        try:
+            await ws_handler_with_cmds(ws)
+        except (websockets.exceptions.InvalidMessage, EOFError, ConnectionResetError):
+            pass  # probe connections / non-WS clients — ไม่ต้อง log
+    async with websockets.serve(_handler, "0.0.0.0", 8765):
+        logger.info("[WS] Dashboard at ws://0.0.0.0:8765 -> open frontend/dashboard.html")
         await asyncio.Future()
 
 
