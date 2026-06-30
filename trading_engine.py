@@ -696,8 +696,23 @@ class TradeManager:
                     )
                     return None
             if not check:
-                logger.error(f"[TRADE] Order failed for {asset} [{effective_kind}] (broker rejected: {order_id})")
-                return None
+                if effective_kind == "digital":
+                    # digital instrument rejected (invalid format or unavailable) → try turbo
+                    logger.warning(
+                        f"[TRADE] Digital rejected for {asset} ({order_id}) — trying turbo fallback"
+                    )
+                    effective_kind = "turbo"
+                    try:
+                        check, order_id = _attempt_buy(effective_kind)
+                    except _cf.TimeoutError:
+                        logger.error(f"[TRADE] TIMEOUT on turbo fallback placing {asset} after 30s — skipping")
+                        return None
+                    if not check:
+                        logger.error(f"[TRADE] Order failed for {asset} [turbo] (broker rejected: {order_id})")
+                        return None
+                else:
+                    logger.error(f"[TRADE] Order failed for {asset} [{effective_kind}] (broker rejected: {order_id})")
+                    return None
           # fall through to record under lock
         except Exception as e:
             logger.error(f"[TRADE] Exception: {e}")
