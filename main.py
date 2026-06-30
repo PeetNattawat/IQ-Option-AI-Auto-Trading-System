@@ -820,7 +820,7 @@ async def ws_handler_with_cmds(websocket):
 
 
 async def ws_server_full():
-    async with websockets.serve(ws_handler_with_cmds, "localhost", 8765):
+    async with websockets.serve(ws_handler_with_cmds, "0.0.0.0", 8765):
         logger.info("[WS] Dashboard at ws://localhost:8765 -> open frontend/dashboard.html")
         await asyncio.Future()
 
