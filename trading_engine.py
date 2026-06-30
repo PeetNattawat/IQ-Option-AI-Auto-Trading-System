@@ -1082,7 +1082,7 @@ class LearningEngine:
 
         # Rule: RSI overbought CALL
         rsi_high_calls = [t for t in closed if t.get("direction") == "CALL" and t.get("rsi", 0) > 75]
-        if len(rsi_high_calls) >= 5:
+        if len(rsi_high_calls) >= 20:  # ต้องมีข้อมูลอย่างน้อย 20 trades ก่อนสรุป (เดิม 5 — ข้อมูลน้อยเกิน)
             wins = sum(1 for t in rsi_high_calls if t.get("result") == "WIN")
             wr = wins / len(rsi_high_calls)
             if wr < 0.4:
@@ -1097,7 +1097,7 @@ class LearningEngine:
 
         # Rule: Low ADX
         low_adx_trades = [t for t in closed if t.get("adx", 99) < 20]
-        if len(low_adx_trades) >= 5:
+        if len(low_adx_trades) >= 20:  # ต้องมีข้อมูลอย่างน้อย 20 trades ก่อนสรุป (เดิม 5 — ข้อมูลน้อยเกิน)
             wins = sum(1 for t in low_adx_trades if t.get("result") == "WIN")
             wr = wins / len(low_adx_trades)
             if wr < 0.45:

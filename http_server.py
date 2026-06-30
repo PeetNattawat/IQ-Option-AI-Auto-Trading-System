@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent
 DASHBOARD_FILE = BASE_DIR / "dashboard.html"
 HTTP_PORT = int(os.getenv("DASHBOARD_HTTP_PORT", "8766"))
-HTTP_HOST = "127.0.0.1"
+HTTP_HOST = "0.0.0.0"
 
 
 async def handle_root(request: web.Request) -> web.Response:

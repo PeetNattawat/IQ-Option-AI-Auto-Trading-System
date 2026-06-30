@@ -112,6 +112,7 @@ class FullTradingBot(TradingBot):
         self._paused = False
         self._cooldown_until = 0.0  # epoch secs; > now = in loss-cooldown (auto-resumes, NOT a hard pause)
         self._iq_lock = asyncio.Lock()  # serialize IQ network calls between run_cycle and the sync loop
+        self._alerted_rule_ids: set = set()  # track rule id ที่แจ้ง Telegram ไปแล้ว — ป้องกันแจ้งซ้ำทุกรอบ
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -359,8 +360,15 @@ class FullTradingBot(TradingBot):
         if self.loop_count % 5 == 0 and self.trade_manager.trades:
             lr = await asyncio.to_thread(self.learning_engine.analyze, self.trade_manager.trades)
             state_store["learning"] = lr
-            if lr.get("disabled_rules") or lr.get("warnings"):
+
+            # แจ้ง Telegram เฉพาะ rule ที่ยังไม่เคยแจ้ง — ป้องกันแจ้งซ้ำทุกรอบ
+            disabled_rules = lr.get("disabled_rules") or []
+            new_rule_ids = {r["id"] for r in disabled_rules if r["id"] not in self._alerted_rule_ids}
+            has_new_warnings = bool(lr.get("warnings")) and not disabled_rules  # warnings-only แจ้งครั้งแรกเสมอ
+            if new_rule_ids or has_new_warnings:
                 asyncio.create_task(self.tg.alert_learning(lr))
+                self._alerted_rule_ids.update(new_rule_ids)
+
             self.trade_manager.learning_rules = self.trade_manager._load_learning_rules()
 
         await broadcast({"type": "update", "data": {
@@ -590,7 +598,7 @@ class FullTradingBot(TradingBot):
             f"🕐 {datetime.now().strftime('%H:%M:%S')}"
         )
 
-    async def handle_telegram_command(self, text: str):
+    async def handle_telegram_command(self, text: str, update_id: int | None = None):
         cmd = text.lstrip("/").split()[0].split("@")[0].lower()
         logger.info(f"[TG-CMD] received: /{cmd}")
         if cmd in ("start", "run", "resume", "go"):
@@ -602,6 +610,12 @@ class FullTradingBot(TradingBot):
         elif cmd == "restart":
             await self.tg.send("🔄 <b>กำลังรีสตาร์ทบอท...</b> จะกลับมาออนไลน์ใน ~15 วินาที")
             logger.warning("[TG-CMD] restart requested — exiting (systemd will relaunch)")
+            # Advance Telegram offset ก่อน exit เพื่อป้องกัน get_updates เจอ /restart ซ้ำตอน boot ใหม่
+            if update_id is not None:
+                try:
+                    await self.tg.get_updates(offset=update_id + 1, timeout=1)
+                except Exception:
+                    pass
             await asyncio.sleep(1)
             os._exit(0)   # systemd Restart=always brings it back
         elif cmd in ("status", "stat", "s"):
@@ -652,7 +666,7 @@ class FullTradingBot(TradingBot):
                     continue
                 if txt.startswith("/"):
                     try:
-                        await self.handle_telegram_command(txt)
+                        await self.handle_telegram_command(txt, update_id=u["update_id"])
                     except Exception as e:
                         logger.error(f"[TG-CMD] handler error: {e}")
 

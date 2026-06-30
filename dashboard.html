@@ -464,7 +464,7 @@ function addLog(cls, msg) {
 // - http:  (local dev)         → ws://localhost:8765
 const WS_URL = location.protocol === 'https:'
   ? 'wss://' + location.hostname + '/ws'
-  : 'ws://' + (location.hostname || 'localhost') + ':8765';
+  : 'ws://localhost:8765';
 
 function connect() {
   ws = new WebSocket(WS_URL);
