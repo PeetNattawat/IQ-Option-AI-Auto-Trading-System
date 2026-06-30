@@ -461,10 +461,10 @@ function addLog(cls, msg) {
 
 // Auto-detect WebSocket URL:
 // - https: (Cloudflare Tunnel) → wss://<same hostname>/ws
-// - http:  (local dev)         → ws://localhost:8765
+// - http:  → ws://<same hostname>:8765 (Tailscale or local)
 const WS_URL = location.protocol === 'https:'
   ? 'wss://' + location.hostname + '/ws'
-  : 'ws://localhost:8765';
+  : 'ws://' + location.hostname + ':8765';
 
 function connect() {
   ws = new WebSocket(WS_URL);
