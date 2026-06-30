@@ -293,7 +293,7 @@ class FullTradingBot(TradingBot):
                 break
             async with self._iq_lock:
                 trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
-            if trade:
+            if isinstance(trade, dict):
                 placed = trade
                 state_store["trades"] = self.trade_manager.trades
                 await broadcast({"type": "new_trade", "data": trade})
