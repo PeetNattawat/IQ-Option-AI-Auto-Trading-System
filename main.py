@@ -291,7 +291,8 @@ class FullTradingBot(TradingBot):
                 break
             if time.time() < self.trade_manager._auto_locked_until:
                 break
-            trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
+            async with self._iq_lock:
+                trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
             if trade:
                 placed = trade
                 state_store["trades"] = self.trade_manager.trades
@@ -820,12 +821,9 @@ async def ws_handler_with_cmds(websocket):
 
 
 async def ws_server_full():
-    async def _handler(ws):
-        try:
-            await ws_handler_with_cmds(ws)
-        except (websockets.exceptions.InvalidMessage, EOFError, ConnectionResetError):
-            pass  # probe connections / non-WS clients — ไม่ต้อง log
-    async with websockets.serve(_handler, "0.0.0.0", 8765):
+    # ปิด log noise จาก probe connections (InvalidMessage/EOFError ก่อน handshake)
+    logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
+    async with websockets.serve(ws_handler_with_cmds, "0.0.0.0", 8765):
         logger.info("[WS] Dashboard at ws://0.0.0.0:8765 -> open frontend/dashboard.html")
         await asyncio.Future()
 
