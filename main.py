@@ -113,6 +113,7 @@ class FullTradingBot(TradingBot):
         self._cooldown_until = 0.0  # epoch secs; > now = in loss-cooldown (auto-resumes, NOT a hard pause)
         self._iq_lock = asyncio.Lock()  # serialize IQ network calls between run_cycle and the sync loop
         self._alerted_rule_ids: set = set()  # track rule id ที่แจ้ง Telegram ไปแล้ว — ป้องกันแจ้งซ้ำทุกรอบ
+        self._prev_asset_status: dict = {}   # snapshot of last known asset_status — used for open/close transition alerts
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -203,6 +204,21 @@ class FullTradingBot(TradingBot):
             except Exception as e:
                 logger.warning(f"[ASSET] resolve failed: {e}")
 
+        # T5 — Transition detection: fire Telegram alerts when market opens or closes.
+        # Skip on first call (_prev_asset_status empty) to avoid flooding alerts at startup.
+        _current_asset_status = state_store.get("asset_status", {})
+        if self._prev_asset_status and _current_asset_status:
+            for _asset, _info in _current_asset_status.items():
+                _prev = self._prev_asset_status.get(_asset, {})
+                if _prev.get("status") != "open" and _info.get("status") == "open":
+                    asyncio.create_task(self.tg.alert_market_open(
+                        _asset, _info.get("kind"), _info.get("payout")
+                    ))
+                elif _prev.get("status") == "open" and _info.get("status") != "open":
+                    asyncio.create_task(self.tg.alert_market_closed(_asset))
+        if _current_asset_status:
+            self._prev_asset_status = {k: dict(v) for k, v in _current_asset_status.items()}
+
         # No real forex pairs open (weekend / outside market hours) — wait, never trade OTC
         if not self.cfg.assets:
             self.log_activity("💤", "ตลาดคู่เงินจริงปิดอยู่ (สุดสัปดาห์/นอกเวลาทำการ) — รอตลาดเปิด · ไม่เทรด OTC", phase="waiting")
@@ -212,6 +228,8 @@ class FullTradingBot(TradingBot):
                 "status": "running", "signals": [], "risk": state_store["risk"],
                 "stats": state_store["stats"], "balance": state_store["balance"],
                 "activity": state_store["activity"], "activity_log": state_store["activity_log"],
+                "asset_status": state_store.get("asset_status", {}),
+                "asset_status_updated_at": state_store.get("asset_status_updated_at"),
             }})
             return
 
@@ -226,6 +244,11 @@ class FullTradingBot(TradingBot):
         candidates = []  # qualifying CALL/PUT signals this cycle
         got_data = False
         for asset in self.cfg.assets:
+            # T3 — Scan gate: safety net for race condition between resolve cycles.
+            # cfg.assets is open-only after resolve, but market can close mid-cycle.
+            if asset not in self.cfg.asset_kind:
+                logger.info(f"[SCAN] Skipping {asset} — market closed")
+                continue
             try:
                 df = await asyncio.wait_for(asyncio.to_thread(self.get_candles, asset), timeout=30)
             except Exception as e:
@@ -388,6 +411,8 @@ class FullTradingBot(TradingBot):
             "account_type": state_store["account_type"],
             "activity": state_store["activity"],
             "activity_log": state_store["activity_log"],
+            "asset_status": state_store.get("asset_status", {}),
+            "asset_status_updated_at": state_store.get("asset_status_updated_at"),
         }})
 
     # ── Command handler from WebSocket ──
@@ -737,6 +762,8 @@ class FullTradingBot(TradingBot):
                 "status": state_store.get("status"),
                 "activity": state_store["activity"],
                 "activity_log": state_store["activity_log"],
+                "asset_status": state_store.get("asset_status", {}),
+                "asset_status_updated_at": state_store.get("asset_status_updated_at"),
             }})
 
     async def main_loop(self):

@@ -9,7 +9,7 @@ import json
 import logging
 import time
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dataclasses import dataclass, asdict
 from collections import deque
@@ -1225,6 +1225,8 @@ state_store = {
     "account_type": "PRACTICE",
     "activity": {},        # current one-line heartbeat: what the bot is doing right now
     "activity_log": [],    # rolling timeline of activity + per-pair decisions
+    "asset_status": {},    # per-asset open/closed/waiting status (built in resolve_assets)
+    "asset_status_updated_at": None,  # ISO 8601 UTC+7 timestamp of last resolve
 }
 
 
@@ -1269,6 +1271,7 @@ class TradingBot:
         self.running = False
         self.loop_count = 0
         self._assets_resolved = False  # True once we have a confirmed tradable (OTC) asset list
+        self._original_assets: list = []  # user-configured asset list before resolve_assets() overwrites cfg.assets
 
     def connect(self) -> bool:
         logger.info(f"[IQ] Connecting as {self.cfg.email} ({self.cfg.account_type})")
@@ -1330,11 +1333,17 @@ class TradingBot:
                 return True
             return len(base) == 6 and base[:3] in FIAT and base[3:] in FIAT
 
+        # Capture user-configured asset list before we overwrite cfg.assets with open-only pairs.
+        # This lets asset_status show CLOSED entries for pairs the user wants but market is shut.
+        if self.cfg.assets and not self._original_assets:
+            self._original_assets = list(self.cfg.assets)
+
         open_kind = {}        # name -> "digital" | "binary" | "turbo"  (digital preferred for real FX)
         name_by_id = {}       # active_id -> name (for readable alert names)
         digital_open = []
         otc_count = 0
         repatched = 0
+        schedule_next_open: dict = {}  # name -> next open epoch (for closed assets next_open field)
 
         # ── 1) binary/turbo via init_v2 (also re-patches the stale name->id table) ──
         init = None
@@ -1402,6 +1411,13 @@ class TradingBot:
                     is_open = any(s.get("open", 0) < now < s.get("close", 0)
                                   for s in (d.get("schedule") or []))
                     if not is_open:
+                        # Capture the next future open time for the asset_status "closed" entry
+                        future_opens = [
+                            s.get("open", 0) for s in (d.get("schedule") or [])
+                            if s.get("open", 0) > now
+                        ]
+                        if future_opens:
+                            schedule_next_open[name] = min(future_opens)
                         continue
                     if name.endswith("-OTC"):
                         otc_count += 1
@@ -1450,6 +1466,24 @@ class TradingBot:
             self.cfg.assets = []
             self.cfg.asset_kind = {}
             self._assets_resolved = False
+            # Build asset_status: all user-configured assets show as "closed" (or "waiting" if list unknown)
+            _tz7 = timezone(timedelta(hours=7))
+            _universe = self._original_assets or list(open_kind.keys())
+            _asset_status_closed: dict = {}
+            for _a in _universe:
+                _next = schedule_next_open.get(_a)
+                _next_str = (
+                    datetime.fromtimestamp(_next, tz=_tz7).isoformat()
+                    if _next else None
+                )
+                _asset_status_closed[_a] = {
+                    "status": "closed",
+                    "kind": None,
+                    "payout": None,
+                    "next_open": _next_str,
+                }
+            state_store["asset_status"] = _asset_status_closed
+            state_store["asset_status_updated_at"] = datetime.now(tz=_tz7).isoformat()
             return
 
         # ── 3) rank by payout (digital payout for digital pairs, binary/turbo profit otherwise) ──
@@ -1490,6 +1524,48 @@ class TradingBot:
         self.cfg.assets = chosen
         self.cfg.asset_kind = {a: open_kind[a] for a in chosen}
         self._assets_resolved = True
+
+        # ── T1: Build asset_status dict ──────────────────────────────────────
+        # Universe = original user-configured list (so closed pairs are visible)
+        # plus any newly discovered open pairs not in the original list.
+        _tz7 = timezone(timedelta(hours=7))
+        _universe = list(self._original_assets) if self._original_assets else []
+        # Also include any open pairs discovered that weren't in original list
+        for _a in chosen:
+            if _a not in _universe:
+                _universe.append(_a)
+
+        def _payout_for_status(name):
+            if open_kind.get(name) == "digital":
+                return digital_payout.get(name)
+            p = profits.get(name, {}) if profits else {}
+            v = p.get("binary") or p.get("turbo")
+            return float(v) if v else None
+
+        asset_status: dict = {}
+        for _a in _universe:
+            if _a in chosen:
+                _p = _payout_for_status(_a)
+                asset_status[_a] = {
+                    "status": "open",
+                    "kind": open_kind.get(_a),
+                    "payout": _p,
+                    "next_open": None,
+                }
+            else:
+                _next = schedule_next_open.get(_a)
+                _next_str = (
+                    datetime.fromtimestamp(_next, tz=_tz7).isoformat()
+                    if _next else None
+                )
+                asset_status[_a] = {
+                    "status": "closed",
+                    "kind": None,
+                    "payout": None,
+                    "next_open": _next_str,
+                }
+        state_store["asset_status"] = asset_status
+        state_store["asset_status_updated_at"] = datetime.now(tz=_tz7).isoformat()
 
     def get_candles(self, asset: str) -> Optional[pd.DataFrame]:
         try:

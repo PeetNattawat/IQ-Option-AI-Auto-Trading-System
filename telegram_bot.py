@@ -252,6 +252,27 @@ class TelegramBot:
         )
         return await self.send(text)
 
+    # ─────────────────────────────────────────
+    #  8) MARKET STATUS ALERTS
+    # ─────────────────────────────────────────
+    async def alert_market_open(self, asset: str, kind: str, payout: float) -> bool:
+        kind_label = {"digital": "Digital", "binary": "Binary", "turbo": "Turbo"}.get(kind or "", kind or "?")
+        payout_str = f"{payout * 100:.0f}%" if payout is not None else "?"
+        text = (
+            f"🟢 <b>เปิดตลาดแล้ว — {_h(self._pretty_asset(asset))}</b>\n"
+            f"\n"
+            f"📊 เครื่องมือ: <b>{kind_label}</b> · Payout: <b>{payout_str}</b>\n"
+            f"\n🕐 {self._now()}"
+        )
+        return await self.send(text)
+
+    async def alert_market_closed(self, asset: str) -> bool:
+        text = (
+            f"🔴 <b>ปิดตลาด — {_h(self._pretty_asset(asset))}</b>\n"
+            f"\n🕐 {self._now()}"
+        )
+        return await self.send(text)
+
     async def alert_learning(self, result: dict) -> bool:
         if not result.get("disabled_rules") and not result.get("warnings"):
             return False
