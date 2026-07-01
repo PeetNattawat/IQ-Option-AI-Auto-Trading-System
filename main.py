@@ -114,6 +114,7 @@ class FullTradingBot(TradingBot):
         self._iq_lock = asyncio.Lock()  # serialize IQ network calls between run_cycle and the sync loop
         self._alerted_rule_ids: set = set()  # track rule id ที่แจ้ง Telegram ไปแล้ว — ป้องกันแจ้งซ้ำทุกรอบ
         self._prev_asset_status: dict = {}   # snapshot of last known asset_status — used for open/close transition alerts
+        self._start_notified: bool = False   # fire alert_bot_start only after first successful resolve
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -203,6 +204,19 @@ class FullTradingBot(TradingBot):
                 self._need_resolve = False
             except Exception as e:
                 logger.warning(f"[ASSET] resolve failed: {e}")
+
+        # Send the bot-start Telegram alert the first time we have a confirmed asset list.
+        # Firing here (after resolve) guarantees the pair count is accurate even if the initial
+        # resolve in main_loop timed out or found no open pairs.
+        if not self._start_notified and self.cfg.assets:
+            self._start_notified = True
+            asyncio.create_task(self.tg.alert_bot_start(
+                account_type=self.cfg.account_type,
+                assets=self.cfg.assets,
+                timeframe=self.cfg.timeframe,
+                trade_amount=self.cfg.trade_amount,
+                confidence_threshold=self.cfg.confidence_threshold,
+            ))
 
         # T5 — Transition detection: fire Telegram alerts when market opens or closes.
         # Skip on first call (_prev_asset_status empty) to avoid flooding alerts at startup.
@@ -843,14 +857,6 @@ class FullTradingBot(TradingBot):
             "status": "running",
         })
         await broadcast({"type": "update", "data": state_store})
-
-        await self.tg.alert_bot_start(
-            account_type=self.cfg.account_type,
-            assets=self.cfg.assets,
-            timeframe=self.cfg.timeframe,
-            trade_amount=self.cfg.trade_amount,
-            confidence_threshold=self.cfg.confidence_threshold,
-        )
 
         self.running = True
         logger.info(f"[BOT] Main loop — aligned to {self.cfg.timeframe}s candle close")
