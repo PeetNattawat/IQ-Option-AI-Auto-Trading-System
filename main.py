@@ -699,6 +699,53 @@ class FullTradingBot(TradingBot):
                     except Exception as e:
                         logger.error(f"[TG-CMD] handler error: {e}")
 
+    async def watchdog_loop(self, check_interval: int = 60, freeze_timeout: int = 180):
+        """Monitor loop_count every check_interval seconds.
+        If loop_count stops growing for freeze_timeout continuous seconds the bot is
+        deadlocked (usually _iq_lock held by a stalled external_sync_loop call).
+        Log CRITICAL and call os._exit(1) so systemd restarts the process cleanly."""
+        _last_count: int = -1
+        _frozen_since: float = 0.0
+
+        while True:
+            await asyncio.sleep(check_interval)
+
+            # Bot is intentionally paused — reset timer, don't count as freeze
+            if self._paused:
+                _frozen_since = 0.0
+                _last_count = self.loop_count
+                continue
+
+            current = self.loop_count
+            if current != _last_count:
+                # Progress made — reset freeze clock
+                _last_count = current
+                _frozen_since = 0.0
+                continue
+
+            # loop_count has not advanced since last check
+            now = time.time()
+            if _frozen_since == 0.0:
+                _frozen_since = now
+                logger.warning(
+                    f"[WATCHDOG] loop_count stuck at {current} — starting freeze timer"
+                )
+                continue
+
+            frozen_seconds = now - _frozen_since
+            if frozen_seconds >= freeze_timeout:
+                active_count = len(self.trade_manager.active_orders) if self.trade_manager else 0
+                logger.critical(
+                    f"[WATCHDOG] CRITICAL — bot frozen for {frozen_seconds:.0f}s "
+                    f"(loop_count={current}, active_orders={active_count}) — calling os._exit(1) for systemd restart"
+                )
+                os._exit(1)
+            else:
+                logger.warning(
+                    f"[WATCHDOG] loop_count still stuck at {current} "
+                    f"— frozen {frozen_seconds:.0f}s / {freeze_timeout}s"
+                )
+
     async def external_sync_loop(self, interval: int = 15):
         """Every ~15s keep the dashboard live: refresh balance, finalize closed trades,
         pull in platform-opened trades, and broadcast a fresh snapshot — independent of
@@ -898,13 +945,15 @@ async def main():
         )
 
     assets_env = os.getenv("IQ_ASSETS", "AUTO").strip()
-    auto_assets = assets_env.upper() == "AUTO"
+    # Empty string or "AUTO" → full dynamic scan; anything else → explicit whitelist
+    auto_assets = not assets_env or assets_env.upper() == "AUTO"
+    _assets_list = None if auto_assets else [a.strip() for a in assets_env.split(",") if a.strip()]
 
     cfg = TradingConfig(
         email=email,
         password=password,
         account_type=raw_account_type,
-        assets=None if auto_assets else assets_env.split(","),
+        assets=_assets_list,
         auto_discover_assets=auto_assets,
         max_assets=int(os.getenv("IQ_MAX_ASSETS", "12")),
         timeframe=int(os.getenv("IQ_TIMEFRAME", "300")),
@@ -938,6 +987,7 @@ async def main():
         bot.main_loop(),
         bot.external_sync_loop(),
         bot.telegram_command_loop(),
+        bot.watchdog_loop(),
     )
 
 

@@ -130,8 +130,10 @@ class TradingConfig:
     min_payout: float = 0.70            # only trade pairs paying at least this (e.g. 0.70 = 70%)
 
     def __post_init__(self):
+        # assets=None means "auto-discover via resolve_assets()"; do NOT hardcode fallback pairs here.
+        # An explicit empty list [] also means auto-discover (set by main.py when IQ_ASSETS is unset/AUTO).
         if self.assets is None:
-            self.assets = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "EURGBP"]
+            self.assets = []
         # name -> instrument kind ("digital" | "binary" | "turbo"), filled by resolve_assets
         self.asset_kind = {}
 
@@ -1437,7 +1439,7 @@ class TradingBot:
 
         # ── MANUAL mode: use cfg.assets as universe instead of full API discovery ──
         if not self.cfg.auto_discover_assets and self.cfg.assets:
-            manual = self.cfg.assets  # user-specified list
+            manual = self.cfg.assets  # user-specified whitelist
             # keep only pairs confirmed open by API (present in open_kind)
             open_manual = [a for a in manual if a in open_kind]
             if not open_manual:
@@ -1451,6 +1453,11 @@ class TradingBot:
                 logger.info(
                     f"[ASSET] Manual mode: {len(open_manual)}/{len(manual)} pairs confirmed open: {open_manual}"
                 )
+        elif not self.cfg.auto_discover_assets and not self.cfg.assets:
+            # assets is empty/None and auto_discover_assets is False → treat as full scan
+            logger.info(
+                "[SCAN] No asset whitelist configured — scanning all open pairs from IQ Option"
+            )
 
         if self.cfg.digital_only:
             open_real = [n for n in open_real if open_kind.get(n) == "digital"]
@@ -1524,6 +1531,7 @@ class TradingBot:
         self.cfg.assets = chosen
         self.cfg.asset_kind = {a: open_kind[a] for a in chosen}
         self._assets_resolved = True
+        logger.info(f"[SCAN] Scanning {len(chosen)} assets (max_assets={self.cfg.max_assets})")
 
         # ── T1: Build asset_status dict ──────────────────────────────────────
         # Universe = original user-configured list (so closed pairs are visible)
