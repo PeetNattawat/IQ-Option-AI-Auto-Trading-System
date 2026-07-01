@@ -300,8 +300,11 @@ class FullTradingBot(TradingBot):
                 asyncio.create_task(self.tg.alert_trade_open(trade))
                 mg = f" · ไม้ {trade.get('mg_step')}" if trade.get("mg_step") else ""
                 self.log_activity("🚀", f"เปิดออเดอร์ {trade['asset']} {trade['direction']} ที่ {(trade.get('confidence') or 0):.0f}%{mg}", phase="trading")
-            # Always stop after one attempt — even if broker rejected, don't try the next signal
-            break
+                break
+            elif trade is None:
+                # Risk block, veto, or order error — stop this cycle
+                break
+            # else: _ORDER_UNAVAILABLE sentinel — asset not available, try next signal
 
         # Summarize the decision so the dashboard shows what the bot is doing / waiting for
         best = max(signals_this_cycle, key=lambda s: s.get("confidence") or 0, default=None)
