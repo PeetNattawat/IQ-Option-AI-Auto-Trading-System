@@ -115,6 +115,7 @@ class FullTradingBot(TradingBot):
         self._alerted_rule_ids: set = set()  # track rule id ที่แจ้ง Telegram ไปแล้ว — ป้องกันแจ้งซ้ำทุกรอบ
         self._prev_asset_status: dict = {}   # snapshot of last known asset_status — used for open/close transition alerts
         self._start_notified: bool = False   # fire alert_bot_start only after first successful resolve
+        self._watchdog_heartbeat: float = time.time()  # updated every cycle + during inter-cycle sleep
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -178,6 +179,7 @@ class FullTradingBot(TradingBot):
             return
 
         self.loop_count += 1
+        self._watchdog_heartbeat = time.time()
         signals_this_cycle = []
 
         # Make sure the IQ socket is alive — reconnect if it dropped (otherwise the loop stalls)
@@ -713,12 +715,12 @@ class FullTradingBot(TradingBot):
                     except Exception as e:
                         logger.error(f"[TG-CMD] handler error: {e}")
 
-    async def watchdog_loop(self, check_interval: int = 60, freeze_timeout: int = 180):
-        """Monitor loop_count every check_interval seconds.
-        If loop_count stops growing for freeze_timeout continuous seconds the bot is
-        deadlocked (usually _iq_lock held by a stalled external_sync_loop call).
+    async def watchdog_loop(self, check_interval: int = 30, freeze_timeout: int = 180):
+        """Monitor _watchdog_heartbeat every check_interval seconds.
+        The heartbeat is pulsed at the start of every run_cycle AND every 30s during
+        the inter-cycle sleep, so the watchdog correctly distinguishes a normal sleep
+        from a genuine deadlock (e.g. _iq_lock held by a stalled coroutine).
         Log CRITICAL and call os._exit(1) so systemd restarts the process cleanly."""
-        _last_count: int = -1
         _frozen_since: float = 0.0
 
         while True:
@@ -727,22 +729,22 @@ class FullTradingBot(TradingBot):
             # Bot is intentionally paused — reset timer, don't count as freeze
             if self._paused:
                 _frozen_since = 0.0
-                _last_count = self.loop_count
                 continue
 
-            current = self.loop_count
-            if current != _last_count:
-                # Progress made — reset freeze clock
-                _last_count = current
+            now = time.time()
+            seconds_since_heartbeat = now - self._watchdog_heartbeat
+
+            if seconds_since_heartbeat < freeze_timeout:
+                # Heartbeat is fresh — no freeze
                 _frozen_since = 0.0
                 continue
 
-            # loop_count has not advanced since last check
-            now = time.time()
+            # Heartbeat is stale — bot may be frozen
             if _frozen_since == 0.0:
                 _frozen_since = now
                 logger.warning(
-                    f"[WATCHDOG] loop_count stuck at {current} — starting freeze timer"
+                    f"[WATCHDOG] heartbeat stale for {seconds_since_heartbeat:.0f}s "
+                    f"(loop_count={self.loop_count}) — starting freeze timer"
                 )
                 continue
 
@@ -750,14 +752,13 @@ class FullTradingBot(TradingBot):
             if frozen_seconds >= freeze_timeout:
                 active_count = len(self.trade_manager.active_orders) if self.trade_manager else 0
                 logger.critical(
-                    f"[WATCHDOG] CRITICAL — bot frozen for {frozen_seconds:.0f}s "
-                    f"(loop_count={current}, active_orders={active_count}) — calling os._exit(1) for systemd restart"
+                    f"[WATCHDOG] CRITICAL — bot frozen for {seconds_since_heartbeat:.0f}s "
+                    f"(loop_count={self.loop_count}, active_orders={active_count}) — calling os._exit(1) for systemd restart"
                 )
                 os._exit(1)
             else:
                 logger.warning(
-                    f"[WATCHDOG] loop_count still stuck at {current} "
-                    f"— frozen {frozen_seconds:.0f}s / {freeze_timeout}s"
+                    f"[WATCHDOG] heartbeat still stale — frozen {seconds_since_heartbeat:.0f}s / {freeze_timeout * 2}s"
                 )
 
     async def external_sync_loop(self, interval: int = 15):
@@ -869,10 +870,16 @@ class FullTradingBot(TradingBot):
                 state_store["status"] = f"error: {e}"
             # Sleep until just after the next candle closes, so each cycle acts on a freshly
             # closed candle (not at an arbitrary offset within the candle).
+            # Pulse the watchdog heartbeat every 30s so the watchdog doesn't mistake
+            # a normal 300s inter-cycle sleep for a freeze.
             tf = self.cfg.timeframe
             now = time.time()
             wait = tf - (now % tf) + 2  # +2s buffer so the broker has finalized the candle
-            await asyncio.sleep(wait)
+            while wait > 0:
+                chunk = min(wait, 30)
+                await asyncio.sleep(chunk)
+                self._watchdog_heartbeat = time.time()
+                wait -= chunk
 
 
 # ─────────────────────────────────────────────────
