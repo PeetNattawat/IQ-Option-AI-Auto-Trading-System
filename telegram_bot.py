@@ -15,11 +15,6 @@ logger = logging.getLogger(__name__)
 _TF_LABEL = {60: "M1", 300: "M5", 900: "M15", 1800: "M30"}
 
 
-def _h(v) -> str:
-    """Escape a dynamic value for Telegram HTML parse_mode."""
-    return html.escape(str(v)) if v is not None else ""
-
-
 @dataclass
 class TelegramConfig:
     bot_token: str
@@ -101,13 +96,12 @@ class TelegramBot:
     async def alert_bot_start(self, *, account_type: str, assets: list, timeframe: int,
                               trade_amount: float, confidence_threshold: float) -> bool:
         acc = "🔴 REAL — เงินจริง" if account_type == "REAL" else "🟢 PRACTICE — เงินทดลอง"
-        tf_label = _h(self._tf_label(timeframe))
         text = (
             f"🟢 <b>บอทเริ่มทำงานแล้ว</b>\n"
             f"\n"
             f"💼 บัญชี: <b>{acc}</b>\n"
             f"📈 คู่เงิน: <b>{len(assets)} คู่</b>\n"
-            f"⏱ ไทม์เฟรม: <b>{tf_label}</b> · หมดอายุ {timeframe // 60} นาที\n"
+            f"⏱ ไทม์เฟรม: <b>{self._tf_label(timeframe)}</b> · หมดอายุ {timeframe // 60} นาที\n"
             f"💵 เงินต่อไม้: <b>฿{trade_amount:.0f}</b>\n"
             f"🎯 เข้าเทรดเมื่อมั่นใจ ≥ <b>{confidence_threshold:.0f}%</b>\n"
             f"\n"
@@ -164,16 +158,14 @@ class TelegramBot:
 
         mg_line = f"🎲 ไม้ทบ (Martingale): สเต็ป {trade['mg_step']}\n" if trade.get("mg_step") else ""
 
-        asset_name = _h(self._pretty_asset(trade.get('asset')))
-        expiry = _h(trade.get('expiry', '?'))
         text = (
             f"🚀 <b>ออกออเดอร์ {self._dir_label(direction)}</b>\n"
             f"\n"
-            f"📌 คู่เงิน: <b>{asset_name}</b>\n"
+            f"📌 คู่เงิน: <b>{self._pretty_asset(trade.get('asset'))}</b>\n"
             f"💵 ลงทุน: <b>฿{trade.get('amount', 0):.0f}</b>\n"
             f"{mg_line}"
             f"{conf_line}"
-            f"⏱ หมดอายุ: <b>{expiry} นาที</b>\n"
+            f"⏱ หมดอายุ: <b>{trade.get('expiry', '?')} นาที</b>\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
             f"{metric_line}"
             f"{reason_block}"
@@ -193,10 +185,9 @@ class TelegramBot:
                 "LOSS": "❌ <b>ผล: แพ้</b>",
                 "EQUAL": "➖ <b>ผล: เสมอ</b> (คืนทุน)"}.get(result, "<b>ผล: ?</b>")
 
-        trade_pnl = trade.get("pnl", 0) or 0
+        pnl = trade.get("pnl", 0) or 0
         amount = trade.get("amount", 0) or 0
-        trade_sign = "+" if trade_pnl >= 0 else ""
-        pnl_label = "กำไร" if trade_pnl >= 0 else "ขาดทุน"
+        sign = "+" if pnl >= 0 else ""
         conf = trade.get("confidence")
         conf_line = f"🎯 ความมั่นใจ: {conf:.0f}%\n" if conf is not None else ""
         mg_line = f"🎲 ไม้ทบ: สเต็ป {trade['mg_step']}\n" if trade.get("mg_step") else ""
@@ -204,19 +195,18 @@ class TelegramBot:
         # Build a clear "สรุปวันนี้" line directly from `today` to avoid slicing issues
         if today:
             wins, losses = today.get("wins", 0), today.get("losses", 0)
-            day_pnl = today.get("pnl", 0) or 0
-            day_sign = "+" if day_pnl >= 0 else ""
-            summary_line = f"\n📈 สรุปวันนี้: {wins}ชนะ / {losses}แพ้ · {day_sign}{day_pnl:.2f} บาท\n"
+            pnl = today.get("pnl", 0) or 0
+            sign = "+" if pnl >= 0 else ""
+            summary_line = f"\n📈 สรุปวันนี้: {wins}ชนะ / {losses}แพ้ · {sign}{pnl:.2f} บาท\n"
         else:
             summary_line = ""
 
-        asset_name = _h(self._pretty_asset(trade.get('asset')))
         text = (
             f"{head}\n"
             f"\n"
-            f"📌 <b>{asset_name}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
+            f"📌 <b>{self._pretty_asset(trade.get('asset'))}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
-            f"💰 ลงทุน ฿{amount:.0f} · {pnl_label} <b>{trade_sign}{trade_pnl:.2f} บาท</b>\n"
+            f"💵 ลงทุน ฿{amount:.0f} → <b>{sign}{pnl:.2f} บาท</b>\n"
             f"{mg_line}"
             f"{conf_line}"
             f"{summary_line}"
@@ -227,11 +217,10 @@ class TelegramBot:
     async def alert_expired(self, trade: dict) -> bool:
         """A trade that could not be resolved (IQ connection drop) and was force-expired
         to free the open-position slot. No PnL impact — informational only."""
-        asset_name = _h(self._pretty_asset(trade.get('asset')))
         text = (
             f"⏰ <b>ออเดอร์ค้าง — เคลียร์ช่องว่างแล้ว</b>\n"
             f"\n"
-            f"📌 <b>{asset_name}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
+            f"📌 <b>{self._pretty_asset(trade.get('asset'))}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
             f"⚠️ ปิดผลไม่ได้ (IQ หลุดการเชื่อมต่อ) — ปล่อยช่องให้เทรดต่อ\n"
             f"ℹ️ ไม่นับแพ้/ชนะ ไม่กระทบยอด\n"
@@ -246,29 +235,8 @@ class TelegramBot:
         text = (
             f"⚠️ <b>หยุดอัตโนมัติ (Risk)</b>\n"
             f"\n"
-            f"{_h(reason)}\n"
+            f"{reason}\n"
             f"บอทหยุดเปิดออเดอร์ใหม่แล้ว\n"
-            f"\n🕐 {self._now()}"
-        )
-        return await self.send(text)
-
-    # ─────────────────────────────────────────
-    #  8) MARKET STATUS ALERTS
-    # ─────────────────────────────────────────
-    async def alert_market_open(self, asset: str, kind: str, payout: float) -> bool:
-        kind_label = {"digital": "Digital", "binary": "Binary", "turbo": "Turbo"}.get(kind or "", kind or "?")
-        payout_str = f"{payout * 100:.0f}%" if payout is not None else "?"
-        text = (
-            f"🟢 <b>เปิดตลาดแล้ว — {_h(self._pretty_asset(asset))}</b>\n"
-            f"\n"
-            f"📊 เครื่องมือ: <b>{kind_label}</b> · Payout: <b>{payout_str}</b>\n"
-            f"\n🕐 {self._now()}"
-        )
-        return await self.send(text)
-
-    async def alert_market_closed(self, asset: str) -> bool:
-        text = (
-            f"🔴 <b>ปิดตลาด — {_h(self._pretty_asset(asset))}</b>\n"
             f"\n🕐 {self._now()}"
         )
         return await self.send(text)
@@ -278,9 +246,9 @@ class TelegramBot:
             return False
         lines = ["🧠 <b>AI เรียนรู้และปรับกฎ</b>", ""]
         for r in result.get("disabled_rules", []):
-            lines.append(f"🚫 ปิดกฎ: {_h(r['reason'])}")
+            lines.append(f"🚫 ปิดกฎ: {r['reason']}")
         for w in result.get("warnings", []):
-            lines.append(f"⚠️ {_h(w)}")
+            lines.append(f"⚠️ {w}")
         lines.append(f"\n🕐 {self._now()}")
         return await self.send("\n".join(lines))
 

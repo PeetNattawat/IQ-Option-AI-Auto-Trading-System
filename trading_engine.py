@@ -9,7 +9,7 @@ import json
 import logging
 import time
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 from dataclasses import dataclass, asdict
 from collections import deque
@@ -45,14 +45,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-# Assets that cannot be traded as digital spot (IQ Option blocks them at the instrument level)
-_DIGITAL_SPOT_UNSUPPORTED = frozenset({"XAUUSD", "BTCUSD", "ETHUSD", "LTCUSD"})
-
-# Sentinel returned by _place_order when the broker rejects an order because the pair
-# is "not available at the moment" — caller uses this to skip to the next signal
-# without counting the attempt as a loss or affecting Martingale.
-_ORDER_UNAVAILABLE = object()
 
 # ─────────────────────────────────────────
 #  CONFIGURATION
@@ -126,14 +118,11 @@ class TradingConfig:
     max_assets: int = 12                # cap when auto-discovering
     trade_otc: bool = False             # NEVER trade OTC (synthetic) pairs — real forex only
     trade_digital: bool = True          # also scan/trade DIGITAL options — real forex usually lives here
-    digital_only: bool = os.getenv("DIGITAL_ONLY", "false").lower() not in ("false", "0", "no")  # skip pairs not on the digital list (no binary/turbo fallback)
     min_payout: float = 0.70            # only trade pairs paying at least this (e.g. 0.70 = 70%)
 
     def __post_init__(self):
-        # assets=None means "auto-discover via resolve_assets()"; do NOT hardcode fallback pairs here.
-        # An explicit empty list [] also means auto-discover (set by main.py when IQ_ASSETS is unset/AUTO).
         if self.assets is None:
-            self.assets = []
+            self.assets = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "EURGBP"]
         # name -> instrument kind ("digital" | "binary" | "turbo"), filled by resolve_assets
         self.asset_kind = {}
 
@@ -650,10 +639,8 @@ class TradeManager:
         """Recompute bucket win-rates from trade history.  Called before each execute_trade."""
         self._bucket_cache = compute_bucket_winrates(self.trades)
 
-    def _place_order(self, asset: str, direction: str, amount: float, meta: dict):
+    def _place_order(self, asset: str, direction: str, amount: float, meta: dict) -> Optional[dict]:
         """Place an order on IQ Option and record it. direction: CALL/PUT.
-        Returns trade dict on success, _ORDER_UNAVAILABLE sentinel when the broker
-        rejects because the pair is unavailable, or None for all other failures.
         Routes to digital-spot for assets resolved as 'digital' (real forex usually trades
         only on digital), otherwise to the binary endpoint.
         Persists adx_band and rsi_band for bucket analysis (item 7)."""
@@ -661,87 +648,14 @@ class TradeManager:
         action = "call" if direction.upper() == "CALL" else "put"
         duration = self.cfg.expiry_minutes
         logger.info(f"[TRADE] Placing {action.upper()} on {asset} [{kind}] | amount {amount} | source {meta.get('source')}")
-        def _attempt_buy(effective_kind: str) -> tuple:
-            """Submit a single buy call and wait up to 30s. Returns (check, order_id) or raises.
-            Does NOT use ThreadPoolExecutor as context manager — shutdown(wait=True) would block
-            forever if buy_digital_spot hangs after the timeout fires."""
-            import concurrent.futures as _cf
-            _ex = _cf.ThreadPoolExecutor(max_workers=1)
-            try:
-                if effective_kind == "digital":
-                    active_v2 = asset.replace("-op", "").replace("-OTC", "")
-                    # Sync live ID: ACTIVES is already patched by resolve_assets() with live IDs;
-                    # OP_code.ACTIVES may be a different object — force-sync before calling v2.
-                    from iqoptionapi.constants import OP_code
-                    live_id = ACTIVES.get(active_v2)
-                    if live_id is not None and OP_code.ACTIVES.get(active_v2) != live_id:
-                        OP_code.ACTIVES[active_v2] = live_id
-                    _fut = _ex.submit(self.iq.buy_digital_spot_v2, active_v2, amount, action, duration)
-                else:
-                    _fut = _ex.submit(self.iq.buy, amount, asset, action, duration)
-                result = _fut.result(timeout=30)
-                _ex.shutdown(wait=False)
-                return result
-            except _cf.TimeoutError:
-                _ex.shutdown(wait=False)  # release immediately — hung thread runs in background
-                raise
-
         try:
-            import concurrent.futures as _cf
-            effective_kind = kind
-            try:
-                check, order_id = _attempt_buy(effective_kind)
-            except _cf.TimeoutError:
-                if effective_kind == "digital":
-                    logger.warning(
-                        f"[TRADE] buy_digital_spot timed out — trying turbo fallback"
-                    )
-                    effective_kind = "turbo"
-                    try:
-                        check, order_id = _attempt_buy(effective_kind)
-                        logger.info(f"[TRADE] Turbo fallback succeeded for {asset}")
-                    except _cf.TimeoutError:
-                        logger.error(
-                            f"[TRADE] TIMEOUT on turbo fallback placing {asset} after 30s — skipping"
-                        )
-                        return None
-                else:
-                    logger.error(
-                        f"[TRADE] TIMEOUT placing {asset} [{effective_kind}] after 30s — skipping"
-                    )
-                    return None
+            if kind == "digital":
+                check, order_id = self.iq.buy_digital_spot(asset, amount, action, duration)
+            else:
+                check, order_id = self.iq.buy(amount, asset, action, duration)
             if not check:
-                if effective_kind == "digital":
-                    # digital instrument rejected (invalid format or unavailable) → try turbo
-                    logger.warning(
-                        f"[TRADE] Digital rejected for {asset} ({order_id}) — trying turbo fallback"
-                    )
-                    effective_kind = "turbo"
-                    try:
-                        check, order_id = _attempt_buy(effective_kind)
-                    except _cf.TimeoutError:
-                        logger.error(f"[TRADE] TIMEOUT on turbo fallback placing {asset} after 30s — skipping")
-                        return None
-                    if not check:
-                        _rej_msg_t = str(order_id).lower() if order_id else ""
-                        if "not available" in _rej_msg_t:
-                            logger.warning(
-                                f"[TRADE] {asset} [turbo] not available at the moment — "
-                                "will try next signal this cycle"
-                            )
-                            return _ORDER_UNAVAILABLE
-                        logger.error(f"[TRADE] Order failed for {asset} [turbo] (broker rejected: {order_id})")
-                        return None
-                else:
-                    _rej_msg = str(order_id).lower() if order_id else ""
-                    if "not available" in _rej_msg:
-                        logger.warning(
-                            f"[TRADE] {asset} [{effective_kind}] not available at the moment — "
-                            "will try next signal this cycle"
-                        )
-                        return _ORDER_UNAVAILABLE
-                    logger.error(f"[TRADE] Order failed for {asset} [{effective_kind}] (broker rejected: {order_id})")
-                    return None
+                logger.error(f"[TRADE] Order failed for {asset} [{kind}] (broker rejected: {order_id})")
+                return None
           # fall through to record under lock
         except Exception as e:
             logger.error(f"[TRADE] Exception: {e}")
@@ -758,7 +672,7 @@ class TradeManager:
             trade = {
                 "id": order_id,
                 "asset": asset,
-                "kind": effective_kind,
+                "kind": kind,
                 "direction": direction.upper(),
                 "amount": amount,
                 "open_time": datetime.now().isoformat(),
@@ -783,14 +697,7 @@ class TradeManager:
             logger.info(f"[TRADE] Order placed: ID {order_id}")
             return trade
 
-    def execute_trade(self, signal: SignalResult, source: str = "auto"):
-        """Place an auto trade for the given signal.
-        Returns:
-          - trade dict on success
-          - _ORDER_UNAVAILABLE sentinel if the broker rejects the pair as unavailable
-            (caller should skip to next signal, no Martingale / loss counters affected)
-          - None for all other failures (risk block, veto, order error)
-        """
+    def execute_trade(self, signal: SignalResult, source: str = "auto") -> Optional[dict]:
         can, reason = self.can_trade()
         if not can:
             logger.warning(f"[RISK] Trade blocked: {reason}")
@@ -851,16 +758,9 @@ class TradeManager:
             instrument_types.add("binary-option")
         if any(t.get("kind") == "digital" for t in self.active_orders.values()):
             instrument_types.add("digital-option")
-        import concurrent.futures as _cf
         for itype in instrument_types:
             try:
-                with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-                    fut = ex.submit(self.iq.get_position_history_v2, itype, 50, 0, 0, 0)
-                    try:
-                        check, msg = fut.result(timeout=8)
-                    except _cf.TimeoutError:
-                        logger.warning(f"[RESULT] position history ({itype}) timed out — skipping")
-                        continue
+                check, msg = self.iq.get_position_history_v2(itype, 50, 0, 0, 0)
                 if not check:
                     continue
                 for p in (msg or {}).get("positions", []):
@@ -929,23 +829,7 @@ class TradeManager:
         except (TypeError, ValueError):
             pnl = 0.0
         trade["pnl"] = pnl
-        # close_reason from IQ Option: "win" | "loose" | "equal"
-        # For external/manual trades the platform sometimes sends None or an unknown string;
-        # fall back to PnL sign so a positive return is never mislabeled LOSS.
-        if close_reason == "win":
-            trade["result"] = "WIN"
-        elif close_reason in ("equal",):
-            trade["result"] = "EQUAL"
-        elif close_reason in ("loose", "loss"):
-            trade["result"] = "LOSS"
-        else:
-            # close_reason missing or unrecognised — use PnL as ground truth
-            if pnl > 0:
-                trade["result"] = "WIN"
-            elif pnl < 0:
-                trade["result"] = "LOSS"
-            else:
-                trade["result"] = "EQUAL"
+        trade["result"] = "WIN" if close_reason == "win" else ("EQUAL" if close_reason == "equal" else "LOSS")
         trade["close_time"] = datetime.now().isoformat()
         trade["status"] = "closed"
         # Risk counter + Martingale ladder track BOT trades only (manual/web don't affect them)
@@ -1018,18 +902,7 @@ class TradeManager:
 
                 # New trade opened outside the bot
                 asset = self.resolve_active_name(msg.get("active_id"))
-                # IQ Option may omit 'direction' from raw_event for manual trades;
-                # fall back through: raw.direction → msg.direction → msg.option_type
-                _dir_raw = (
-                    raw.get("direction")
-                    or msg.get("direction")
-                    or msg.get("option_type")
-                    or ""
-                )
-                direction = _dir_raw.upper().replace("CALL", "CALL").replace("PUT", "PUT")
-                # Map platform aliases (e.g. "call"/"put" literal strings from option_type)
-                if direction not in ("CALL", "PUT"):
-                    direction = {"CALL": "CALL", "PUT": "PUT"}.get(direction, direction)
+                direction = (raw.get("direction") or "").upper()
                 amount = float(msg.get("invest") or raw.get("amount") or 0)
                 open_ms = msg.get("open_time") or raw.get("open_time_millisecond")
                 try:
@@ -1138,7 +1011,7 @@ class LearningEngine:
 
         # Rule: RSI overbought CALL
         rsi_high_calls = [t for t in closed if t.get("direction") == "CALL" and t.get("rsi", 0) > 75]
-        if len(rsi_high_calls) >= 20:  # ต้องมีข้อมูลอย่างน้อย 20 trades ก่อนสรุป (เดิม 5 — ข้อมูลน้อยเกิน)
+        if len(rsi_high_calls) >= 5:
             wins = sum(1 for t in rsi_high_calls if t.get("result") == "WIN")
             wr = wins / len(rsi_high_calls)
             if wr < 0.4:
@@ -1153,7 +1026,7 @@ class LearningEngine:
 
         # Rule: Low ADX
         low_adx_trades = [t for t in closed if t.get("adx", 99) < 20]
-        if len(low_adx_trades) >= 20:  # ต้องมีข้อมูลอย่างน้อย 20 trades ก่อนสรุป (เดิม 5 — ข้อมูลน้อยเกิน)
+        if len(low_adx_trades) >= 5:
             wins = sum(1 for t in low_adx_trades if t.get("result") == "WIN")
             wr = wins / len(low_adx_trades)
             if wr < 0.45:
@@ -1227,8 +1100,6 @@ state_store = {
     "account_type": "PRACTICE",
     "activity": {},        # current one-line heartbeat: what the bot is doing right now
     "activity_log": [],    # rolling timeline of activity + per-pair decisions
-    "asset_status": {},    # per-asset open/closed/waiting status (built in resolve_assets)
-    "asset_status_updated_at": None,  # ISO 8601 UTC+7 timestamp of last resolve
 }
 
 
@@ -1273,7 +1144,6 @@ class TradingBot:
         self.running = False
         self.loop_count = 0
         self._assets_resolved = False  # True once we have a confirmed tradable (OTC) asset list
-        self._original_assets: list = []  # user-configured asset list before resolve_assets() overwrites cfg.assets
 
     def connect(self) -> bool:
         logger.info(f"[IQ] Connecting as {self.cfg.email} ({self.cfg.account_type})")
@@ -1320,8 +1190,6 @@ class TradingBot:
         # Fiat-currency whitelist: IQ-tradeable majors covering all real forex crosses.
         # Excludes crypto (BTC/ETH), gold (XAU), silver (XAG), oil (USO), etc. by construction.
         FIAT = {"EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
-        # Extra non-FIAT pairs explicitly allowed (gold, crypto).
-        EXTRA_PAIRS = {"XAUUSD", "BTCUSD"}
 
         def is_fx(name):
             # real (non-OTC) FIAT forex only. IQ names the REAL binary/turbo option "XXXXXX-op",
@@ -1331,21 +1199,13 @@ class TradingBot:
             if name.endswith("-OTC"):              # never trade OTC (synthetic) pairs
                 return False
             base = name[:-3] if name.endswith("-op") else name
-            if base in EXTRA_PAIRS:                # allow gold and crypto
-                return True
             return len(base) == 6 and base[:3] in FIAT and base[3:] in FIAT
-
-        # Capture user-configured asset list before we overwrite cfg.assets with open-only pairs.
-        # This lets asset_status show CLOSED entries for pairs the user wants but market is shut.
-        if self.cfg.assets and not self._original_assets:
-            self._original_assets = list(self.cfg.assets)
 
         open_kind = {}        # name -> "digital" | "binary" | "turbo"  (digital preferred for real FX)
         name_by_id = {}       # active_id -> name (for readable alert names)
         digital_open = []
         otc_count = 0
         repatched = 0
-        schedule_next_open: dict = {}  # name -> next open epoch (for closed assets next_open field)
 
         # ── 1) binary/turbo via init_v2 (also re-patches the stale name->id table) ──
         init = None
@@ -1413,13 +1273,6 @@ class TradingBot:
                     is_open = any(s.get("open", 0) < now < s.get("close", 0)
                                   for s in (d.get("schedule") or []))
                     if not is_open:
-                        # Capture the next future open time for the asset_status "closed" entry
-                        future_opens = [
-                            s.get("open", 0) for s in (d.get("schedule") or [])
-                            if s.get("open", 0) > now
-                        ]
-                        if future_opens:
-                            schedule_next_open[name] = min(future_opens)
                         continue
                     if name.endswith("-OTC"):
                         otc_count += 1
@@ -1436,33 +1289,6 @@ class TradingBot:
             logger.info(f"[ASSET] Synced {repatched} live active ids into the name->id table")
 
         open_real = sorted(open_kind)
-
-        # ── MANUAL mode: use cfg.assets as universe instead of full API discovery ──
-        if not self.cfg.auto_discover_assets and self.cfg.assets:
-            manual = self.cfg.assets  # user-specified whitelist
-            # keep only pairs confirmed open by API (present in open_kind)
-            open_manual = [a for a in manual if a in open_kind]
-            if not open_manual:
-                # fallback: none of the manual pairs found open — use full discovered list
-                logger.warning(
-                    "[ASSET] Manual list: none of the specified pairs found open "
-                    "— falling back to auto-discovered list"
-                )
-            else:
-                open_real = open_manual
-                logger.info(
-                    f"[ASSET] Manual mode: {len(open_manual)}/{len(manual)} pairs confirmed open: {open_manual}"
-                )
-        elif not self.cfg.auto_discover_assets and not self.cfg.assets:
-            # assets is empty/None and auto_discover_assets is False → treat as full scan
-            logger.info(
-                "[SCAN] No asset whitelist configured — scanning all open pairs from IQ Option"
-            )
-
-        if self.cfg.digital_only:
-            open_real = [n for n in open_real if open_kind.get(n) == "digital"]
-            if not open_real:
-                logger.warning("[ASSET] digital_only=True but no digital pairs open — all filtered out")
         logger.info(f"[ASSET] open real-FX: {open_real or 'none'} "
                     f"(digital: {sorted(digital_open) or 'none'}) | OTC open: {otc_count}")
 
@@ -1473,24 +1299,6 @@ class TradingBot:
             self.cfg.assets = []
             self.cfg.asset_kind = {}
             self._assets_resolved = False
-            # Build asset_status: all user-configured assets show as "closed" (or "waiting" if list unknown)
-            _tz7 = timezone(timedelta(hours=7))
-            _universe = self._original_assets or list(open_kind.keys())
-            _asset_status_closed: dict = {}
-            for _a in _universe:
-                _next = schedule_next_open.get(_a)
-                _next_str = (
-                    datetime.fromtimestamp(_next, tz=_tz7).isoformat()
-                    if _next else None
-                )
-                _asset_status_closed[_a] = {
-                    "status": "closed",
-                    "kind": None,
-                    "payout": None,
-                    "next_open": _next_str,
-                }
-            state_store["asset_status"] = _asset_status_closed
-            state_store["asset_status_updated_at"] = datetime.now(tz=_tz7).isoformat()
             return
 
         # ── 3) rank by payout (digital payout for digital pairs, binary/turbo profit otherwise) ──
@@ -1522,58 +1330,12 @@ class TradingBot:
         else:
             chosen = ranked[: self.cfg.max_assets]
 
-        # Strip assets that are not supported on digital spot (e.g. XAUUSD, BTCUSD)
-        chosen = [a for a in chosen if a.replace("-op", "").replace("-OTC", "") not in _DIGITAL_SPOT_UNSUPPORTED]
-
         if chosen != self.cfg.assets:
             label = ", ".join(f"{a}[{open_kind[a]}] {payout(a)*100:.0f}%" for a in chosen)
             logger.info(f"[ASSET] Tradable (by payout): {label}")
         self.cfg.assets = chosen
         self.cfg.asset_kind = {a: open_kind[a] for a in chosen}
         self._assets_resolved = True
-        logger.info(f"[SCAN] Scanning {len(chosen)} assets (max_assets={self.cfg.max_assets})")
-
-        # ── T1: Build asset_status dict ──────────────────────────────────────
-        # Universe = original user-configured list (so closed pairs are visible)
-        # plus any newly discovered open pairs not in the original list.
-        _tz7 = timezone(timedelta(hours=7))
-        _universe = list(self._original_assets) if self._original_assets else []
-        # Also include any open pairs discovered that weren't in original list
-        for _a in chosen:
-            if _a not in _universe:
-                _universe.append(_a)
-
-        def _payout_for_status(name):
-            if open_kind.get(name) == "digital":
-                return digital_payout.get(name)
-            p = profits.get(name, {}) if profits else {}
-            v = p.get("binary") or p.get("turbo")
-            return float(v) if v else None
-
-        asset_status: dict = {}
-        for _a in _universe:
-            if _a in chosen:
-                _p = _payout_for_status(_a)
-                asset_status[_a] = {
-                    "status": "open",
-                    "kind": open_kind.get(_a),
-                    "payout": _p,
-                    "next_open": None,
-                }
-            else:
-                _next = schedule_next_open.get(_a)
-                _next_str = (
-                    datetime.fromtimestamp(_next, tz=_tz7).isoformat()
-                    if _next else None
-                )
-                asset_status[_a] = {
-                    "status": "closed",
-                    "kind": None,
-                    "payout": None,
-                    "next_open": _next_str,
-                }
-        state_store["asset_status"] = asset_status
-        state_store["asset_status_updated_at"] = datetime.now(tz=_tz7).isoformat()
 
     def get_candles(self, asset: str) -> Optional[pd.DataFrame]:
         try:
@@ -1599,8 +1361,6 @@ class TradingBot:
         balance = self.iq.get_balance()
         state_store["balance"] = round(balance, 2)
 
-        # Pass 1: scan every asset, collect signals + candle data
-        actionable_signals: list[SignalResult] = []   # signals that pass confidence threshold
         for asset in self.cfg.assets:
             df = self.get_candles(asset)
             if df is None or len(df) < 50:
@@ -1611,39 +1371,17 @@ class TradingBot:
             signals_this_cycle.append(asdict(signal))
             logger.info(f"[SIGNAL] {asset}: {signal.signal} | Score: {signal.confidence:.1f}% | RSI: {signal.rsi:.1f}")
 
+            # Execute trade if signal is actionable
             if signal.signal in ("CALL", "PUT") and signal.confidence >= self.cfg.confidence_threshold:
-                actionable_signals.append(signal)
+                trade = self.trade_manager.execute_trade(signal)
+                if trade:
+                    state_store["trades"] = self.trade_manager.trades
+                    await broadcast({"type": "new_trade", "data": trade})
 
             # Store last candles for chart (last 50)
             state_store["candles"][asset] = df.tail(50)[["open", "high", "low", "close", "volume", "ema_fast", "ema_slow", "rsi", "atr", "macd_hist"]].to_dict("records")
 
             await asyncio.sleep(0.5)
-
-        # Pass 2: try to place exactly one trade per cycle, highest confidence first.
-        # If a pair is rejected with "not available", skip to the next one — no side
-        # effects on Martingale / consecutive_losses / hourly_trades for that attempt.
-        # Any other failure keeps existing behavior (execute_trade already handles it).
-        actionable_signals.sort(key=lambda s: s.confidence, reverse=True)
-
-        # Check global risk gates once before looping — if blocked, no pair will trade anyway.
-        can, block_reason = self.trade_manager.can_trade()
-        if not can:
-            logger.warning(f"[RISK] Trade blocked for all pairs this cycle: {block_reason}")
-        else:
-            for signal in actionable_signals:
-                result = self.trade_manager.execute_trade(signal)
-                if result is _ORDER_UNAVAILABLE:
-                    # Broker says pair unavailable — try next highest-confidence signal
-                    logger.info(
-                        f"[CYCLE] {signal.asset} unavailable — trying next signal in this cycle"
-                    )
-                    continue
-                if result is not None:
-                    # Trade placed successfully — done for this cycle
-                    state_store["trades"] = self.trade_manager.trades
-                    await broadcast({"type": "new_trade", "data": result})
-                break
-                # result is None: per-pair veto or order failure — stop; existing behavior
 
         # Check completed trades
         self.trade_manager.check_results()

@@ -4,7 +4,6 @@ Run: python main.py
 """
 
 import asyncio
-import html
 import json
 import logging
 import os
@@ -34,16 +33,10 @@ from trading_engine import (
     ws_server, broadcast, state_store, connected_clients,
 )
 from telegram_bot import TelegramBot, TelegramConfig
-from http_server import run_http_server
 
 logger = logging.getLogger(__name__)
 
 RUNTIME_CONFIG_PATH = Path("data/config.json")
-
-
-def _h(v) -> str:
-    """Escape a dynamic value for Telegram HTML parse_mode."""
-    return html.escape(str(v)) if v is not None else ""
 
 
 def load_runtime_config() -> dict:
@@ -112,10 +105,6 @@ class FullTradingBot(TradingBot):
         self._paused = False
         self._cooldown_until = 0.0  # epoch secs; > now = in loss-cooldown (auto-resumes, NOT a hard pause)
         self._iq_lock = asyncio.Lock()  # serialize IQ network calls between run_cycle and the sync loop
-        self._alerted_rule_ids: set = set()  # track rule id ที่แจ้ง Telegram ไปแล้ว — ป้องกันแจ้งซ้ำทุกรอบ
-        self._prev_asset_status: dict = {}   # snapshot of last known asset_status — used for open/close transition alerts
-        self._start_notified: bool = False   # fire alert_bot_start only after first successful resolve
-        self._watchdog_heartbeat: float = time.time()  # updated every cycle + during inter-cycle sleep
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -179,7 +168,6 @@ class FullTradingBot(TradingBot):
             return
 
         self.loop_count += 1
-        self._watchdog_heartbeat = time.time()
         signals_this_cycle = []
 
         # Make sure the IQ socket is alive — reconnect if it dropped (otherwise the loop stalls)
@@ -207,34 +195,6 @@ class FullTradingBot(TradingBot):
             except Exception as e:
                 logger.warning(f"[ASSET] resolve failed: {e}")
 
-        # Send the bot-start Telegram alert the first time we have a confirmed asset list.
-        # Firing here (after resolve) guarantees the pair count is accurate even if the initial
-        # resolve in main_loop timed out or found no open pairs.
-        if not self._start_notified and self.cfg.assets:
-            self._start_notified = True
-            asyncio.create_task(self.tg.alert_bot_start(
-                account_type=self.cfg.account_type,
-                assets=self.cfg.assets,
-                timeframe=self.cfg.timeframe,
-                trade_amount=self.cfg.trade_amount,
-                confidence_threshold=self.cfg.confidence_threshold,
-            ))
-
-        # T5 — Transition detection: fire Telegram alerts when market opens or closes.
-        # Skip on first call (_prev_asset_status empty) to avoid flooding alerts at startup.
-        _current_asset_status = state_store.get("asset_status", {})
-        if self._prev_asset_status and _current_asset_status:
-            for _asset, _info in _current_asset_status.items():
-                _prev = self._prev_asset_status.get(_asset, {})
-                if _prev.get("status") != "open" and _info.get("status") == "open":
-                    asyncio.create_task(self.tg.alert_market_open(
-                        _asset, _info.get("kind"), _info.get("payout")
-                    ))
-                elif _prev.get("status") == "open" and _info.get("status") != "open":
-                    asyncio.create_task(self.tg.alert_market_closed(_asset))
-        if _current_asset_status:
-            self._prev_asset_status = {k: dict(v) for k, v in _current_asset_status.items()}
-
         # No real forex pairs open (weekend / outside market hours) — wait, never trade OTC
         if not self.cfg.assets:
             self.log_activity("💤", "ตลาดคู่เงินจริงปิดอยู่ (สุดสัปดาห์/นอกเวลาทำการ) — รอตลาดเปิด · ไม่เทรด OTC", phase="waiting")
@@ -244,8 +204,6 @@ class FullTradingBot(TradingBot):
                 "status": "running", "signals": [], "risk": state_store["risk"],
                 "stats": state_store["stats"], "balance": state_store["balance"],
                 "activity": state_store["activity"], "activity_log": state_store["activity_log"],
-                "asset_status": state_store.get("asset_status", {}),
-                "asset_status_updated_at": state_store.get("asset_status_updated_at"),
             }})
             return
 
@@ -260,11 +218,6 @@ class FullTradingBot(TradingBot):
         candidates = []  # qualifying CALL/PUT signals this cycle
         got_data = False
         for asset in self.cfg.assets:
-            # T3 — Scan gate: safety net for race condition between resolve cycles.
-            # cfg.assets is open-only after resolve, but market can close mid-cycle.
-            if asset not in self.cfg.asset_kind:
-                logger.info(f"[SCAN] Skipping {asset} — market closed")
-                continue
             try:
                 df = await asyncio.wait_for(asyncio.to_thread(self.get_candles, asset), timeout=30)
             except Exception as e:
@@ -330,20 +283,16 @@ class FullTradingBot(TradingBot):
                 break
             if time.time() < self.trade_manager._auto_locked_until:
                 break
-            async with self._iq_lock:
-                trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
-            if isinstance(trade, dict):
+            trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
+            if trade:
                 placed = trade
                 state_store["trades"] = self.trade_manager.trades
                 await broadcast({"type": "new_trade", "data": trade})
                 asyncio.create_task(self.tg.alert_trade_open(trade))
                 mg = f" · ไม้ {trade.get('mg_step')}" if trade.get("mg_step") else ""
                 self.log_activity("🚀", f"เปิดออเดอร์ {trade['asset']} {trade['direction']} ที่ {(trade.get('confidence') or 0):.0f}%{mg}", phase="trading")
-                break
-            elif trade is None:
-                # Risk block, veto, or order error — stop this cycle
-                break
-            # else: _ORDER_UNAVAILABLE sentinel — asset not available, try next signal
+            # Always stop after one attempt — even if broker rejected, don't try the next signal
+            break
 
         # Summarize the decision so the dashboard shows what the bot is doing / waiting for
         best = max(signals_this_cycle, key=lambda s: s.get("confidence") or 0, default=None)
@@ -403,15 +352,8 @@ class FullTradingBot(TradingBot):
         if self.loop_count % 5 == 0 and self.trade_manager.trades:
             lr = await asyncio.to_thread(self.learning_engine.analyze, self.trade_manager.trades)
             state_store["learning"] = lr
-
-            # แจ้ง Telegram เฉพาะ rule ที่ยังไม่เคยแจ้ง — ป้องกันแจ้งซ้ำทุกรอบ
-            disabled_rules = lr.get("disabled_rules") or []
-            new_rule_ids = {r["id"] for r in disabled_rules if r["id"] not in self._alerted_rule_ids}
-            has_new_warnings = bool(lr.get("warnings")) and not disabled_rules  # warnings-only แจ้งครั้งแรกเสมอ
-            if new_rule_ids or has_new_warnings:
+            if lr.get("disabled_rules") or lr.get("warnings"):
                 asyncio.create_task(self.tg.alert_learning(lr))
-                self._alerted_rule_ids.update(new_rule_ids)
-
             self.trade_manager.learning_rules = self.trade_manager._load_learning_rules()
 
         await broadcast({"type": "update", "data": {
@@ -427,8 +369,6 @@ class FullTradingBot(TradingBot):
             "account_type": state_store["account_type"],
             "activity": state_store["activity"],
             "activity_log": state_store["activity_log"],
-            "asset_status": state_store.get("asset_status", {}),
-            "asset_status_updated_at": state_store.get("asset_status_updated_at"),
         }})
 
     # ── Command handler from WebSocket ──
@@ -571,8 +511,7 @@ class FullTradingBot(TradingBot):
         sig_by_asset = {s["asset"]: s for s in signals}
 
         for asset in assets:
-            raw_name = asset[:-3] if asset.endswith("-op") else asset  # drop IQ '-op' suffix for display
-            name = _h(raw_name)
+            name = asset[:-3] if asset.endswith("-op") else asset  # drop IQ '-op' suffix for display
             s = sig_by_asset.get(asset)
             if not s:
                 lines.append(f"⬜ <b>{name}</b> — รอข้อมูล")
@@ -615,7 +554,7 @@ class FullTradingBot(TradingBot):
 
     def _tg_status_text(self) -> str:
         r = self.build_risk()
-        act = html.escape((state_store.get("activity") or {}).get("msg", "-"))
+        act = (state_store.get("activity") or {}).get("msg", "-")
         raw_status = state_store.get("status", "-")
         _status_map = {
             "running": "🟢 กำลังทำงาน",
@@ -627,10 +566,10 @@ class FullTradingBot(TradingBot):
         if self._paused:
             status = "⏸ หยุดชั่วคราว"
         elif raw_status.startswith("error"):
-            err_detail = _h(raw_status[6:].strip()) if len(raw_status) > 5 else ""
+            err_detail = raw_status[6:].strip() if len(raw_status) > 5 else ""
             status = f"❌ ผิดพลาด{': ' + err_detail if err_detail else ''}"
         else:
-            status = _status_map.get(raw_status, _h(raw_status))
+            status = _status_map.get(raw_status, raw_status)
         return (
             f"🤖 <b>สถานะบอท</b>\n\n"
             f"สถานะ: <b>{status}</b>\n"
@@ -643,7 +582,7 @@ class FullTradingBot(TradingBot):
             f"🕐 {datetime.now().strftime('%H:%M:%S')}"
         )
 
-    async def handle_telegram_command(self, text: str, update_id: int | None = None):
+    async def handle_telegram_command(self, text: str):
         cmd = text.lstrip("/").split()[0].split("@")[0].lower()
         logger.info(f"[TG-CMD] received: /{cmd}")
         if cmd in ("start", "run", "resume", "go"):
@@ -655,12 +594,6 @@ class FullTradingBot(TradingBot):
         elif cmd == "restart":
             await self.tg.send("🔄 <b>กำลังรีสตาร์ทบอท...</b> จะกลับมาออนไลน์ใน ~15 วินาที")
             logger.warning("[TG-CMD] restart requested — exiting (systemd will relaunch)")
-            # Advance Telegram offset ก่อน exit เพื่อป้องกัน get_updates เจอ /restart ซ้ำตอน boot ใหม่
-            if update_id is not None:
-                try:
-                    await self.tg.get_updates(offset=update_id + 1, timeout=1)
-                except Exception:
-                    pass
             await asyncio.sleep(1)
             os._exit(0)   # systemd Restart=always brings it back
         elif cmd in ("status", "stat", "s"):
@@ -711,55 +644,9 @@ class FullTradingBot(TradingBot):
                     continue
                 if txt.startswith("/"):
                     try:
-                        await self.handle_telegram_command(txt, update_id=u["update_id"])
+                        await self.handle_telegram_command(txt)
                     except Exception as e:
                         logger.error(f"[TG-CMD] handler error: {e}")
-
-    async def watchdog_loop(self, check_interval: int = 30, freeze_timeout: int = 180):
-        """Monitor _watchdog_heartbeat every check_interval seconds.
-        The heartbeat is pulsed at the start of every run_cycle AND every 30s during
-        the inter-cycle sleep, so the watchdog correctly distinguishes a normal sleep
-        from a genuine deadlock (e.g. _iq_lock held by a stalled coroutine).
-        Log CRITICAL and call os._exit(1) so systemd restarts the process cleanly."""
-        _frozen_since: float = 0.0
-
-        while True:
-            await asyncio.sleep(check_interval)
-
-            # Bot is intentionally paused — reset timer, don't count as freeze
-            if self._paused:
-                _frozen_since = 0.0
-                continue
-
-            now = time.time()
-            seconds_since_heartbeat = now - self._watchdog_heartbeat
-
-            if seconds_since_heartbeat < freeze_timeout:
-                # Heartbeat is fresh — no freeze
-                _frozen_since = 0.0
-                continue
-
-            # Heartbeat is stale — bot may be frozen
-            if _frozen_since == 0.0:
-                _frozen_since = now
-                logger.warning(
-                    f"[WATCHDOG] heartbeat stale for {seconds_since_heartbeat:.0f}s "
-                    f"(loop_count={self.loop_count}) — starting freeze timer"
-                )
-                continue
-
-            frozen_seconds = now - _frozen_since
-            if frozen_seconds >= freeze_timeout:
-                active_count = len(self.trade_manager.active_orders) if self.trade_manager else 0
-                logger.critical(
-                    f"[WATCHDOG] CRITICAL — bot frozen for {seconds_since_heartbeat:.0f}s "
-                    f"(loop_count={self.loop_count}, active_orders={active_count}) — calling os._exit(1) for systemd restart"
-                )
-                os._exit(1)
-            else:
-                logger.warning(
-                    f"[WATCHDOG] heartbeat still stale — frozen {seconds_since_heartbeat:.0f}s / {freeze_timeout * 2}s"
-                )
 
     async def external_sync_loop(self, interval: int = 15):
         """Every ~15s keep the dashboard live: refresh balance, finalize closed trades,
@@ -824,8 +711,6 @@ class FullTradingBot(TradingBot):
                 "status": state_store.get("status"),
                 "activity": state_store["activity"],
                 "activity_log": state_store["activity_log"],
-                "asset_status": state_store.get("asset_status", {}),
-                "asset_status_updated_at": state_store.get("asset_status_updated_at"),
             }})
 
     async def main_loop(self):
@@ -859,6 +744,14 @@ class FullTradingBot(TradingBot):
         })
         await broadcast({"type": "update", "data": state_store})
 
+        await self.tg.alert_bot_start(
+            account_type=self.cfg.account_type,
+            assets=self.cfg.assets,
+            timeframe=self.cfg.timeframe,
+            trade_amount=self.cfg.trade_amount,
+            confidence_threshold=self.cfg.confidence_threshold,
+        )
+
         self.running = True
         logger.info(f"[BOT] Main loop — aligned to {self.cfg.timeframe}s candle close")
 
@@ -870,16 +763,10 @@ class FullTradingBot(TradingBot):
                 state_store["status"] = f"error: {e}"
             # Sleep until just after the next candle closes, so each cycle acts on a freshly
             # closed candle (not at an arbitrary offset within the candle).
-            # Pulse the watchdog heartbeat every 30s so the watchdog doesn't mistake
-            # a normal 300s inter-cycle sleep for a freeze.
             tf = self.cfg.timeframe
             now = time.time()
             wait = tf - (now % tf) + 2  # +2s buffer so the broker has finalized the candle
-            while wait > 0:
-                chunk = min(wait, 30)
-                await asyncio.sleep(chunk)
-                self._watchdog_heartbeat = time.time()
-                wait -= chunk
+            await asyncio.sleep(wait)
 
 
 # ─────────────────────────────────────────────────
@@ -911,10 +798,8 @@ async def ws_handler_with_cmds(websocket):
 
 
 async def ws_server_full():
-    # ปิด log noise จาก probe connections (InvalidMessage/EOFError ก่อน handshake)
-    logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
-    async with websockets.serve(ws_handler_with_cmds, "0.0.0.0", 8765):
-        logger.info("[WS] Dashboard at ws://0.0.0.0:8765 -> open frontend/dashboard.html")
+    async with websockets.serve(ws_handler_with_cmds, "localhost", 8765):
+        logger.info("[WS] Dashboard at ws://localhost:8765 -> open frontend/dashboard.html")
         await asyncio.Future()
 
 
@@ -958,15 +843,13 @@ async def main():
         )
 
     assets_env = os.getenv("IQ_ASSETS", "AUTO").strip()
-    # Empty string or "AUTO" → full dynamic scan; anything else → explicit whitelist
-    auto_assets = not assets_env or assets_env.upper() == "AUTO"
-    _assets_list = None if auto_assets else [a.strip() for a in assets_env.split(",") if a.strip()]
+    auto_assets = assets_env.upper() == "AUTO"
 
     cfg = TradingConfig(
         email=email,
         password=password,
         account_type=raw_account_type,
-        assets=_assets_list,
+        assets=None if auto_assets else assets_env.split(","),
         auto_discover_assets=auto_assets,
         max_assets=int(os.getenv("IQ_MAX_ASSETS", "12")),
         timeframe=int(os.getenv("IQ_TIMEFRAME", "300")),
@@ -996,11 +879,9 @@ async def main():
 
     await asyncio.gather(
         ws_server_full(),
-        run_http_server(),
         bot.main_loop(),
         bot.external_sync_loop(),
         bot.telegram_command_loop(),
-        bot.watchdog_loop(),
     )
 
 

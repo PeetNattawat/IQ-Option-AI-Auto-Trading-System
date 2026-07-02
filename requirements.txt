@@ -4,5 +4,5 @@ pandas
 numpy
 websockets
 python-dotenv
-aiohttp>=3.9,<4
+aiohttp
 requests
