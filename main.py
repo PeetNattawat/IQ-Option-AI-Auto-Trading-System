@@ -799,7 +799,7 @@ class FullTradingBot(TradingBot):
             # closed candle (not at an arbitrary offset within the candle).
             tf = self.cfg.timeframe
             now = time.time()
-            wait = tf - (now % tf) + 2  # +2s buffer so the broker has finalized the candle
+            wait = tf - (now % tf) + 8  # +8s buffer — gives IQ Option time to roll over to the next expiry slot after the candle boundary (was +2s; buy attempts near the boundary were hitting "asset not available"/timeout)
             await asyncio.sleep(wait)
 
 
