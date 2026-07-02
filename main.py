@@ -282,6 +282,7 @@ class FullTradingBot(TradingBot):
         if in_cooldown:
             remain = int((self._cooldown_until - time.time()) / 60) + 1
             self.log_activity("⏳", f"พักหลังแพ้ติดกัน — เหลืออีก ~{remain} นาที จึงกลับมาเปิดออเดอร์", phase="cooldown")
+        unavailable_this_cycle: list[str] = []
         for signal in candidates:
             if in_cooldown:
                 break
@@ -295,6 +296,7 @@ class FullTradingBot(TradingBot):
             if trade is _ORDER_UNAVAILABLE:
                 # Broker says pair unavailable right now — try next highest-confidence signal
                 logger.info(f"[CYCLE] {signal.asset} unavailable — trying next signal this cycle")
+                unavailable_this_cycle.append(signal.asset)
                 continue
             if isinstance(trade, dict):
                 placed = trade
@@ -317,6 +319,10 @@ class FullTradingBot(TradingBot):
                 reason = f"รอปิดไม้ที่เปิดอยู่ก่อน ({len(self.trade_manager.active_orders)} open)"
             else:
                 _, reason = self.trade_manager.can_trade()
+            if unavailable_this_cycle and len(unavailable_this_cycle) == len(candidates):
+                reason = f"broker ปฏิเสธคู่ที่เข้าเงื่อนไขทั้งหมด ({', '.join(unavailable_this_cycle)}) — ไม่พร้อมเทรดตอนนี้"
+            elif unavailable_this_cycle:
+                reason = f"{reason} · ข้าม {', '.join(unavailable_this_cycle)} (broker: ไม่พร้อมเทรด)"
             self.log_activity("⛔", f"มี {len(candidates)} คู่เข้าเงื่อนไข แต่ยังไม่เปิด: {reason}", level="warn", phase="blocked")
         elif placed is None:
             self.log_activity("💤", f"ยังไม่มีคู่เข้าเงื่อนไข (≥{self.cfg.confidence_threshold:.0f}%) — รอสัญญาณ · เด่นสุด {best_txt}", phase="waiting")
