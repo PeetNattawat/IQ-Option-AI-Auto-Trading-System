@@ -851,7 +851,7 @@ async def main():
         account_type=raw_account_type,
         assets=None if auto_assets else assets_env.split(","),
         auto_discover_assets=auto_assets,
-        max_assets=int(os.getenv("IQ_MAX_ASSETS", "12")),
+        max_assets=int(os.getenv("IQ_MAX_ASSETS", "999")),
         timeframe=int(os.getenv("IQ_TIMEFRAME", "300")),
         trade_amount=float(os.getenv("IQ_AMOUNT", "50.0")),
         confidence_threshold=float(os.getenv("IQ_CONFIDENCE", "70.0")),

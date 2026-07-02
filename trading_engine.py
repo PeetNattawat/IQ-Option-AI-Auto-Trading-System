@@ -115,7 +115,7 @@ class TradingConfig:
 
     # Asset discovery
     auto_discover_assets: bool = False  # scan all open forex pairs (binary/turbo/digital)
-    max_assets: int = 12                # cap when auto-discovering
+    max_assets: int = 999               # cap when auto-discovering (999 = effectively no cap)
     trade_otc: bool = False             # NEVER trade OTC (synthetic) pairs — real forex only
     trade_digital: bool = True          # also scan/trade DIGITAL options — real forex usually lives here
     min_payout: float = 0.70            # only trade pairs paying at least this (e.g. 0.70 = 70%)
