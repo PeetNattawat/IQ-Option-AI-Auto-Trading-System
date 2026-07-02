@@ -32,6 +32,7 @@ from trading_engine import (
     TradingConfig, TradingBot, IndicatorEngine,
     SignalEngine, TradeManager, LearningEngine,
     ws_server, broadcast, state_store, connected_clients,
+    _ORDER_UNAVAILABLE,
 )
 from telegram_bot import TelegramBot, TelegramConfig
 
@@ -290,14 +291,19 @@ class FullTradingBot(TradingBot):
             if time.time() < self.trade_manager._auto_locked_until:
                 break
             trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
-            if trade:
+            if trade is _ORDER_UNAVAILABLE:
+                # Broker says pair unavailable right now — try next highest-confidence signal
+                logger.info(f"[CYCLE] {signal.asset} unavailable — trying next signal this cycle")
+                continue
+            if isinstance(trade, dict):
                 placed = trade
                 state_store["trades"] = self.trade_manager.trades
                 await broadcast({"type": "new_trade", "data": trade})
                 asyncio.create_task(self.tg.alert_trade_open(trade))
                 mg = f" · ไม้ {trade.get('mg_step')}" if trade.get("mg_step") else ""
                 self.log_activity("🚀", f"เปิดออเดอร์ {trade['asset']} {trade['direction']} ที่ {(trade.get('confidence') or 0):.0f}%{mg}", phase="trading")
-            # Always stop after one attempt — even if broker rejected, don't try the next signal
+            # trade is None (risk block / veto / other order error) or a placed trade —
+            # either way, stop trying further signals this cycle.
             break
 
         # Summarize the decision so the dashboard shows what the bot is doing / waiting for

@@ -46,6 +46,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Sentinel returned by _place_order when the broker rejects an order because the pair
+# is "not available at the moment" — caller uses this to skip to the next signal
+# without counting the attempt as a loss or affecting Martingale.
+_ORDER_UNAVAILABLE = object()
+
 # ─────────────────────────────────────────
 #  CONFIGURATION
 # ─────────────────────────────────────────
@@ -639,8 +644,10 @@ class TradeManager:
         """Recompute bucket win-rates from trade history.  Called before each execute_trade."""
         self._bucket_cache = compute_bucket_winrates(self.trades)
 
-    def _place_order(self, asset: str, direction: str, amount: float, meta: dict) -> Optional[dict]:
+    def _place_order(self, asset: str, direction: str, amount: float, meta: dict):
         """Place an order on IQ Option and record it. direction: CALL/PUT.
+        Returns trade dict on success, _ORDER_UNAVAILABLE sentinel when the broker
+        rejects because the pair is unavailable, or None for all other failures.
         Routes to digital-spot for assets resolved as 'digital' (real forex usually trades
         only on digital), otherwise to the binary endpoint.
         Persists adx_band and rsi_band for bucket analysis (item 7)."""
@@ -654,6 +661,13 @@ class TradeManager:
             else:
                 check, order_id = self.iq.buy(amount, asset, action, duration)
             if not check:
+                _rej_msg = str(order_id).lower() if order_id else ""
+                if "not available" in _rej_msg:
+                    logger.warning(
+                        f"[TRADE] {asset} [{kind}] not available at the moment — "
+                        "will try next signal this cycle"
+                    )
+                    return _ORDER_UNAVAILABLE
                 logger.error(f"[TRADE] Order failed for {asset} [{kind}] (broker rejected: {order_id})")
                 return None
           # fall through to record under lock
@@ -697,7 +711,14 @@ class TradeManager:
             logger.info(f"[TRADE] Order placed: ID {order_id}")
             return trade
 
-    def execute_trade(self, signal: SignalResult, source: str = "auto") -> Optional[dict]:
+    def execute_trade(self, signal: SignalResult, source: str = "auto"):
+        """Place an auto trade for the given signal.
+        Returns:
+          - trade dict on success
+          - _ORDER_UNAVAILABLE sentinel if the broker rejects the pair as unavailable
+            (caller should skip to next signal, no Martingale / loss counters affected)
+          - None for all other failures (risk block, veto, order error)
+        """
         can, reason = self.can_trade()
         if not can:
             logger.warning(f"[RISK] Trade blocked: {reason}")
