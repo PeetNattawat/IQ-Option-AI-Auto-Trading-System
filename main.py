@@ -784,6 +784,7 @@ class FullTradingBot(TradingBot):
             timeframe=self.cfg.timeframe,
             trade_amount=self.cfg.trade_amount,
             confidence_threshold=self.cfg.confidence_threshold,
+            assets_resolved=self._assets_resolved,
         )
 
         self.running = True

@@ -99,14 +99,16 @@ class TelegramBot:
     #  1) SYSTEM ON / OFF
     # ─────────────────────────────────────────
     async def alert_bot_start(self, *, account_type: str, assets: list, timeframe: int,
-                              trade_amount: float, confidence_threshold: float) -> bool:
+                              trade_amount: float, confidence_threshold: float,
+                              assets_resolved: bool = True) -> bool:
         acc = "🔴 REAL — เงินจริง" if account_type == "REAL" else "🟢 PRACTICE — เงินทดลอง"
         tf_label = _h(self._tf_label(timeframe))
+        pairs_label = f"{len(assets)} คู่" if assets_resolved else "กำลังสแกน..."
         text = (
             f"🟢 <b>บอทเริ่มทำงานแล้ว</b>\n"
             f"\n"
             f"💼 บัญชี: <b>{acc}</b>\n"
-            f"📈 คู่เงิน: <b>{len(assets)} คู่</b>\n"
+            f"📈 คู่เงิน: <b>{pairs_label}</b>\n"
             f"⏱ ไทม์เฟรม: <b>{tf_label}</b> · หมดอายุ {timeframe // 60} นาที\n"
             f"💵 เงินต่อไม้: <b>฿{trade_amount:.0f}</b>\n"
             f"🎯 เข้าเทรดเมื่อมั่นใจ ≥ <b>{confidence_threshold:.0f}%</b>\n"
