@@ -203,9 +203,9 @@ class TelegramBot:
         # Build a clear "สรุปวันนี้" line directly from `today` to avoid slicing issues
         if today:
             wins, losses = today.get("wins", 0), today.get("losses", 0)
-            pnl = today.get("pnl", 0) or 0
-            sign = "+" if pnl >= 0 else ""
-            summary_line = f"\n📈 สรุปวันนี้: {wins}ชนะ / {losses}แพ้ · {sign}{pnl:.2f} บาท\n"
+            day_pnl = today.get("pnl", 0) or 0
+            day_sign = "+" if day_pnl >= 0 else ""
+            summary_line = f"\n📈 สรุปวันนี้: {wins}ชนะ / {losses}แพ้ · {day_sign}{day_pnl:.2f} บาท\n"
         else:
             summary_line = ""
 
