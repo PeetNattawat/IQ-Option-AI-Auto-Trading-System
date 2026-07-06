@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from dataclasses import asdict
 
 import websockets
@@ -113,6 +114,7 @@ class FullTradingBot(TradingBot):
         self._cooldown_until = 0.0  # epoch secs; > now = in loss-cooldown (auto-resumes, NOT a hard pause)
         self._iq_lock = asyncio.Lock()  # serialize IQ network calls between run_cycle and the sync loop
         self._alerted_rule_ids: set = set()  # track rule id ที่แจ้ง Telegram ไปแล้ว — ป้องกันแจ้งซ้ำทุกรอบ
+        self._weekend_halt = False   # True = TH calendar Sat/Sun — proactive clock-based gate, distinct from _paused/_cooldown_until
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -168,8 +170,35 @@ class FullTradingBot(TradingBot):
             "rsi_put_max": self.cfg.rsi_put_max,
         }
 
+    def _compute_weekend_halt(self) -> bool:
+        """TH-time clock check — pure function, no I/O. Sat/Sun local to Asia/Bangkok."""
+        now_th = datetime.now(ZoneInfo("Asia/Bangkok"))
+        return now_th.weekday() in (5, 6)  # 5=Sat, 6=Sun
+
+    def _handle_weekend_transition(self, is_weekend: bool):
+        """Fire exactly one Telegram alert per Fri→Sat and Sun→Mon transition."""
+        was_weekend = self._weekend_halt
+        if is_weekend and not was_weekend:
+            asyncio.create_task(self.tg.alert_weekend_closed())
+        elif was_weekend and not is_weekend:
+            asyncio.create_task(self.tg.alert_weekend_resumed())
+        self._weekend_halt = is_weekend
+
     # ── Override run_cycle to send Telegram alerts ──
     async def run_cycle(self):
+        # ── Weekend halt gate (TH time) — cheapest check, runs first, no network ──
+        is_weekend = self._compute_weekend_halt()          # pure clock check
+        self._handle_weekend_transition(is_weekend)          # edge-trigger alert only
+        if is_weekend:
+            state_store["status"] = "weekend_halt"
+            self.log_activity("🌙", "สุดสัปดาห์ (เสาร์-อาทิตย์ เวลาไทย) — บอทหยุดพักอัตโนมัติ ไม่เช็คตลาด", phase="weekend_halt")
+            await broadcast({"type": "update", "data": {
+                "status": "weekend_halt",
+                "activity": state_store["activity"],
+                "activity_log": state_store["activity_log"],
+            }})
+            return
+
         if self._paused:
             state_store["status"] = "paused"
             await broadcast({"type": "update", "data": state_store})

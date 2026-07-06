@@ -6,3 +6,4 @@ websockets
 python-dotenv
 aiohttp
 requests
+tzdata

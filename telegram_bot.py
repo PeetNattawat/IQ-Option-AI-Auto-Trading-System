@@ -129,6 +129,22 @@ class TelegramBot:
     async def alert_bot_resumed(self) -> bool:
         return await self.send(f"▶️ <b>บอทกลับมาเทรดต่อแล้ว</b>\n🕐 {self._now()}")
 
+    async def alert_weekend_closed(self) -> bool:
+        text = (
+            f"🌙 <b>ตลาดปิดสุดสัปดาห์</b>\n"
+            f"ระบบหยุดสแกนชั่วคราว (เสาร์-อาทิตย์ เวลาไทย) — จะกลับมาอัตโนมัติเช้าวันจันทร์\n"
+            f"\n🕐 {self._now()}"
+        )
+        return await self.send(text)
+
+    async def alert_weekend_resumed(self) -> bool:
+        text = (
+            f"☀️ <b>ตลาดเปิดแล้ว — เข้าสู่วันจันทร์</b>\n"
+            f"ระบบกลับมาสแกนหาสัญญาณตามปกติ\n"
+            f"\n🕐 {self._now()}"
+        )
+        return await self.send(text)
+
     @staticmethod
     def _today_line(today: dict) -> str:
         if not today:
