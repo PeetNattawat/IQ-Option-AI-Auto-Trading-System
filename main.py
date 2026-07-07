@@ -70,6 +70,37 @@ RUNTIME_FIELDS = [
 ]
 
 
+# Safety bounds — config.json (or a dashboard `update_settings` edit) can never silently
+# push a safety-critical field weaker than these. "min" bounds guard fields where a LOWER
+# value is less safe (adx_min, expiry_minutes, loss_cooldown_minutes); "max" bounds guard
+# fields where a HIGHER value is less safe (max_consecutive_losses, daily_loss_limit).
+# Root cause this prevents (see .wolf/buglog.json history): TradingConfig dataclass defaults
+# were already safe, but config.json silently overrode them with no validation, weakening the
+# ADX gate below the intended floor. Applied inside apply_runtime_config() so both call sites
+# (startup load + dashboard update_settings) are covered by one fix.
+SAFETY_BOUNDS = {
+    "adx_min":                ("min", 20.0),
+    "expiry_minutes":         ("min", 5),
+    "loss_cooldown_minutes":  ("min", 10),
+    "max_consecutive_losses": ("max", 5),
+    "daily_loss_limit":       ("max", 300.0),
+}
+
+
+def _clamp_safety_bounds(cfg: TradingConfig):
+    """Clamp any RUNTIME_FIELDS value that has drifted past its approved safety bound."""
+    for field, (kind, bound) in SAFETY_BOUNDS.items():
+        cur = getattr(cfg, field, None)
+        if cur is None:
+            continue
+        if kind == "min" and cur < bound:
+            logger.warning(f"[CONFIG] {field}={cur} below safety floor {bound} — clamped to {bound}")
+            setattr(cfg, field, bound)
+        elif kind == "max" and cur > bound:
+            logger.warning(f"[CONFIG] {field}={cur} above safety ceiling {bound} — clamped to {bound}")
+            setattr(cfg, field, bound)
+
+
 def save_runtime_config(cfg: TradingConfig):
     os.makedirs("data", exist_ok=True)
     with open(RUNTIME_CONFIG_PATH, "w") as f:
@@ -78,8 +109,9 @@ def save_runtime_config(cfg: TradingConfig):
 
 def apply_runtime_config(cfg: TradingConfig, rt: dict):
     """Apply persisted/dashboard settings onto cfg, coercing to the field's type.
-    Martingale OFF (default): max_consecutive_losses is left as-is so the 4-loss
-    cooldown fires independently of the (disabled) martingale ladder."""
+    Martingale OFF (default): max_consecutive_losses is left as-is so the configured
+    cooldown fires independently of the (disabled) martingale ladder. A final safety-bounds
+    clamp always runs at the end regardless of martingale on/off (see SAFETY_BOUNDS)."""
     for k in RUNTIME_FIELDS:
         if k not in rt:
             continue
@@ -99,6 +131,9 @@ def apply_runtime_config(cfg: TradingConfig, rt: dict):
         cfg.max_consecutive_losses = max(cfg.max_consecutive_losses, cfg.martingale_max_steps)
         # Global single Martingale ladder — only 1 auto trade at a time
         cfg.max_open_positions = 1
+    # Final safety net — clamp regardless of martingale on/off, and regardless of which
+    # call site (startup or dashboard update_settings) invoked this function.
+    _clamp_safety_bounds(cfg)
 
 
 # ─────────────────────────────────────────────────

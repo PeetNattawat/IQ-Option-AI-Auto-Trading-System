@@ -137,7 +137,7 @@ class TradingConfig:
 # ─────────────────────────────────────────
 def adx_band(adx: float) -> str:
     """Classify ADX into coarse bands for bucket logging and win-rate veto.
-    Trades are only placed when adx >= adx_min (25), so the first band won't appear
+    Trades are only placed when adx >= adx_min (30), so the first band won't appear
     in live trade records — it exists so the band function is complete for analysis."""
     if adx < 28:
         return "lt28"
