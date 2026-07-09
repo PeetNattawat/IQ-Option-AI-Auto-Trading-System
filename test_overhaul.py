@@ -325,6 +325,180 @@ check("TradingConfig.rsi_call_max default = 63", cfg_default.rsi_call_max == 63.
 
 
 # ══════════════════════════════════════════════
+#  BUG-143 regression — martingale must default OFF even when the config
+#  dict/file is missing the key entirely (not just when the dataclass is
+#  constructed bare). This is the exact "config.json missing/corrupt" case
+#  Iris's QA report flagged as the real-world risk.
+# ══════════════════════════════════════════════
+print("\n--- Bug-143: martingale_enabled fallback when config key is absent ---")
+from main import apply_runtime_config
+
+cfg_no_key = TradingConfig()
+apply_runtime_config(cfg_no_key, {})  # empty dict == config.json missing / key absent
+check("apply_runtime_config({}) leaves martingale_enabled = False",
+      cfg_no_key.martingale_enabled == False, f"got {cfg_no_key.martingale_enabled}")
+
+cfg_other_keys = TradingConfig()
+apply_runtime_config(cfg_other_keys, {"trade_amount": 100.0, "max_open_positions": 2})
+check("apply_runtime_config(dict without martingale_enabled key) leaves martingale_enabled = False",
+      cfg_other_keys.martingale_enabled == False, f"got {cfg_other_keys.martingale_enabled}")
+
+
+# ══════════════════════════════════════════════
+#  BUG-144 regression — PLACE_ORDER latency check must run BEFORE the broker
+#  call, and a trade that WAS actually placed must never be silently
+#  un-tracked (no-overlap / PnL / trade_logger bookkeeping must always match
+#  broker reality). See .wolf/buglog.json bug-144, Iris QA report BUG-3.
+# ══════════════════════════════════════════════
+print("\n--- Bug-144: PLACE_ORDER latency check happens before the broker call ---")
+import time
+import time as _time
+from datetime import datetime as _datetime
+from zoneinfo import ZoneInfo as _ZoneInfo
+from state_machine import BotStateMachine, LATENCY_BUDGET_SECONDS
+from entry_signal import EntryResult
+from trend_filter import TrendState
+
+_BANGKOK = _ZoneInfo("Asia/Bangkok")
+
+
+class _FakeTimeFilter:
+    def is_tradeable(self, now):
+        return True, ""
+
+
+class _FakeRiskManager:
+    def __init__(self):
+        self._open_positions = 0
+        self.results_recorded = []
+
+    def roll_boundaries(self, now, balance):
+        pass
+
+    def can_trade(self, now, balance):
+        return True, ""
+
+    def stake_amount(self, balance):
+        return 10.0
+
+    def record_order_placed(self):
+        self._open_positions += 1
+
+    def record_order_result(self, pnl, result, now_th=None):
+        self._open_positions = max(0, self._open_positions - 1)
+        self.results_recorded.append((pnl, result))
+
+
+class _FakeEntrySignal:
+    def evaluate(self, asset, trend, df):
+        return EntryResult(asset=asset, signal="CALL", reason="test signal", pattern="engulfing")
+
+
+class _FakeCandleStore:
+    def m5_df(self):
+        return None
+
+    def m15_df(self):
+        return None
+
+
+def _make_sm(place_order_fn):
+    asset = "EURUSD-op"
+    rm = _FakeRiskManager()
+    sm = BotStateMachine(
+        assets=[asset],
+        candle_stores={asset: _FakeCandleStore()},
+        trend_filter=None,
+        entry_signal=_FakeEntrySignal(),
+        time_filter=_FakeTimeFilter(),
+        risk_manager=rm,
+        place_order_fn=place_order_fn,
+        get_balance_fn=lambda: 1000.0,
+        now_fn=lambda: _datetime.now(_BANGKOK),
+    )
+    sm.trend_states[asset] = TrendState(asset=asset, status="UPTREND", ema20=1.0, ema50=0.9,
+                                         atr14=0.001, computed_at="2026-07-09T00:00:00")
+    return sm, rm, asset
+
+
+# Case 1: broker call is instant (well under budget) -> order placed & tracked normally.
+def _instant_broker(asset, side, stake):
+    return {"id": "T1", "asset": asset, "side": side, "stake": stake}
+
+sm1, rm1, asset1 = _make_sm(_instant_broker)
+state1 = sm1.on_m5_close(asset1)
+check("fast broker call -> state IN_TRADE", state1.state == "IN_TRADE", f"got {state1.state}")
+check("fast broker call -> open_positions == 1", rm1._open_positions == 1, f"got {rm1._open_positions}")
+
+
+# Case 2: our OWN pre-broker-call processing already blew the latency budget
+# (simulated by monkey-patching time.time to jump forward before place_order_fn
+# would be called). The broker must NEVER be called in this case.
+_broker_called = {"count": 0}
+
+def _should_never_be_called(asset, side, stake):
+    _broker_called["count"] += 1
+    return {"id": "SHOULD_NOT_HAPPEN", "asset": asset, "side": side, "stake": stake}
+
+sm2, rm2, asset2 = _make_sm(_should_never_be_called)
+_real_time = time.time
+_slow_start = {"t0": None}
+
+def _fake_time_slow():
+    if _slow_start["t0"] is None:
+        _slow_start["t0"] = _real_time()
+        return _slow_start["t0"]
+    # every subsequent call (including the pre-call latency check) is already
+    # past the budget, simulating slow internal processing before submission.
+    return _slow_start["t0"] + LATENCY_BUDGET_SECONDS + 1.0
+
+time.time = _fake_time_slow
+try:
+    state2 = sm2.on_m5_close(asset2)
+finally:
+    time.time = _real_time
+
+check("pre-call latency exceeded -> broker NEVER called", _broker_called["count"] == 0,
+      f"got {_broker_called['count']} calls")
+check("pre-call latency exceeded -> state IDLE (signal cancelled)", state2.state == "IDLE",
+      f"got {state2.state}")
+check("pre-call latency exceeded -> open_positions untouched (never incremented)",
+      rm2._open_positions == 0, f"got {rm2._open_positions}")
+
+
+# Case 3: the broker call ITSELF is slow (round-trip > budget) but DOES succeed —
+# a real position now exists at the broker. This must be tracked normally
+# (IN_TRADE, open_positions incremented, trade dict flagged latency_violation),
+# never silently discarded like the pre-fix bug did.
+def _slow_but_successful_broker(asset, side, stake):
+    _time.sleep(0)  # no real sleep needed; latency is injected via fake clock below
+    return {"id": "T3", "asset": asset, "side": side, "stake": stake}
+
+sm3, rm3, asset3 = _make_sm(_slow_but_successful_broker)
+_call_count = {"n": 0}
+_t0 = _real_time()
+
+def _fake_time_roundtrip():
+    _call_count["n"] += 1
+    # 1st call = candle_close_event_time, 2nd = pre-call check (still fast),
+    # 3rd+ = post-broker-call latency measurement (now slow).
+    if _call_count["n"] <= 2:
+        return _t0
+    return _t0 + LATENCY_BUDGET_SECONDS + 1.0
+
+time.time = _fake_time_roundtrip
+try:
+    state3 = sm3.on_m5_close(asset3)
+finally:
+    time.time = _real_time
+
+check("post-broker-call latency exceeded -> trade STILL tracked as IN_TRADE",
+      state3.state == "IN_TRADE", f"got {state3.state}")
+check("post-broker-call latency exceeded -> open_positions == 1 (not discarded)",
+      rm3._open_positions == 1, f"got {rm3._open_positions}")
+
+
+# ══════════════════════════════════════════════
 #  SUMMARY
 # ══════════════════════════════════════════════
 print(f"\n{'='*50}")

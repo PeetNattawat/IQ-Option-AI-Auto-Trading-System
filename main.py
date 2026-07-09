@@ -36,6 +36,19 @@ from trading_engine import (
     _ORDER_UNAVAILABLE,
 )
 from telegram_bot import TelegramBot, TelegramConfig
+from risk_manager import RiskConfig, RiskManager
+from martingale import MartingaleModule, WARNING_TEXT as MARTINGALE_WARNING_TEXT
+
+# Known tradable pairs for set_pairs validation (spec §12 multi-pair config — not
+# hard-locked to EUR/USD, default selection only). Mirrors the FIAT whitelist logic
+# in TradingBot.resolve_assets() (trading_engine.py) so the two lists can't drift —
+# any 6-letter combination of these currencies plus the IQ "-op" suffix is accepted.
+_FIAT = ("EUR", "USD", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF")
+
+
+def _is_known_pair(name: str) -> bool:
+    base = name[:-3] if name.endswith("-op") else name
+    return len(base) == 6 and base[:3] in _FIAT and base[3:] in _FIAT
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +80,10 @@ RUNTIME_FIELDS = [
     "adx_min", "dir_margin",                         # quality gates (item 4)
     "rsi_call_min", "rsi_call_max",                  # RSI zones (item 5)
     "rsi_put_min", "rsi_put_max",
+    # ── spec-overhaul fields (San's Architecture Notes §12) ──
+    "strategy_mode", "stake_pct", "weekly_loss_limit_pct", "daily_loss_limit_pct",
+    "signal_cooldown_minutes", "auto_stop_enabled", "auto_stop_drawdown_pct",
+    "martingale_ack_risk", "enabled_pairs", "default_pair",
 ]
 
 
@@ -131,6 +148,17 @@ def apply_runtime_config(cfg: TradingConfig, rt: dict):
         cfg.max_consecutive_losses = max(cfg.max_consecutive_losses, cfg.martingale_max_steps)
         # Global single Martingale ladder — only 1 auto trade at a time
         cfg.max_open_positions = 1
+    # ADR-4 — server-side enforcement: martingale_enabled=True is only ever honored
+    # together with martingale_ack_risk=True in the same payload. A partial/corrupted
+    # config (e.g. only martingale_enabled survives a bad write) can never silently
+    # activate the ladder — this check runs on every apply, not just at toggle time.
+    ok, _reason = MartingaleModule.validate_toggle(cfg.martingale_enabled, cfg.martingale_ack_risk)
+    if not ok:
+        logger.warning(f"[CONFIG] martingale_enabled rejected — martingale_ack_risk missing: {_reason}")
+        cfg.martingale_enabled = False
+    # auto_stop_drawdown_pct is two-sided clamped (5-50%), unlike the single-direction
+    # SAFETY_BOUNDS entries below.
+    cfg.auto_stop_drawdown_pct = max(5.0, min(50.0, cfg.auto_stop_drawdown_pct))
     # Final safety net — clamp regardless of martingale on/off, and regardless of which
     # call site (startup or dashboard update_settings) invoked this function.
     _clamp_safety_bounds(cfg)
@@ -150,6 +178,16 @@ class FullTradingBot(TradingBot):
         self._iq_lock = asyncio.Lock()  # serialize IQ network calls between run_cycle and the sync loop
         self._alerted_rule_ids: set = set()  # track rule id ที่แจ้ง Telegram ไปแล้ว — ป้องกันแจ้งซ้ำทุกรอบ
         self._weekend_halt = False   # True = TH calendar Sat/Sun — proactive clock-based gate, distinct from _paused/_cooldown_until
+        # spec_v1 RiskManager — tracks counters in parallel per San's §13.1 contract so
+        # Pixel/Iris can build/test against the real shape now. Does NOT gate the live
+        # legacy trading path (see build_risk_v2 docstring / strategy_mode rationale).
+        self._risk_v2 = RiskManager(RiskConfig(
+            stake_pct=cfg.stake_pct, daily_loss_limit_pct=cfg.daily_loss_limit_pct,
+            weekly_loss_limit_pct=cfg.weekly_loss_limit_pct,
+            signal_cooldown_minutes=cfg.signal_cooldown_minutes,
+            auto_stop_enabled=cfg.auto_stop_enabled,
+            auto_stop_drawdown_pct=cfg.auto_stop_drawdown_pct,
+        ))
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -203,7 +241,43 @@ class FullTradingBot(TradingBot):
             "rsi_call_max": self.cfg.rsi_call_max,
             "rsi_put_min": self.cfg.rsi_put_min,
             "rsi_put_max": self.cfg.rsi_put_max,
+            # ── spec-overhaul fields (San's Architecture Notes §13.1) ──
+            "strategy_mode": self.cfg.strategy_mode,
+            "enabled_pairs": self.cfg.enabled_pairs,
+            "default_pair": self.cfg.default_pair,
+            "stake_pct": self.cfg.stake_pct,
+            "auto_stop_enabled": self.cfg.auto_stop_enabled,
+            "auto_stop_drawdown_pct": self.cfg.auto_stop_drawdown_pct,
+            "martingale_ack_risk": self.cfg.martingale_ack_risk,
         }
+
+    def build_risk_v2(self) -> dict:
+        """Exact §13.1 `risk` shape, computed from the spec_v1 RiskManager (self._risk_v2).
+        Tracks real counters in parallel with the live legacy engine so Pixel/Iris can
+        build/test against this contract now — it does NOT gate the legacy trading path
+        (cfg.strategy_mode == "legacy" is still what actually places live orders; see the
+        strategy_mode field default rationale in trading_engine.TradingConfig)."""
+        if not self._risk_v2:
+            return {}
+        return self._risk_v2.to_state_dict(balance=state_store.get("balance"))
+
+    def build_state_machine_v2(self) -> dict:
+        """§13.1 `state_machine` + `global_state`. spec_v1 isn't driving live orders yet
+        (strategy_mode default = "legacy") so every asset reports IDLE with an explanatory
+        reason rather than a fabricated in-progress state."""
+        assets = self.cfg.enabled_pairs or [self.cfg.default_pair]
+        reason = ("spec_v1 modules built + unit-tested, not yet driving live orders — "
+                   "awaiting a passing out-of-sample backtest (spec §10) before cutover")
+        return {
+            "state_machine": {a: {"state": "IDLE", "since": datetime.now().isoformat(), "reason": reason}
+                               for a in assets},
+            "global_state": "RUNNING",
+        }
+
+    def build_martingale_warning(self) -> str | None:
+        if self.cfg.martingale_enabled and self.cfg.martingale_ack_risk:
+            return MARTINGALE_WARNING_TEXT
+        return None
 
     def _compute_weekend_halt(self) -> bool:
         """TH-time clock check — pure function, no I/O. Sat/Sun local to Asia/Bangkok."""
@@ -370,6 +444,11 @@ class FullTradingBot(TradingBot):
                 asyncio.create_task(self.tg.alert_trade_open(trade))
                 mg = f" · ไม้ {trade.get('mg_step')}" if trade.get("mg_step") else ""
                 self.log_activity("🚀", f"เปิดออเดอร์ {trade['asset']} {trade['direction']} ที่ {(trade.get('confidence') or 0):.0f}%{mg}", phase="trading")
+                # spec_v1 §13.1 counters — parallel bookkeeping only, does not gate the live order
+                try:
+                    self._risk_v2.record_order_placed()
+                except Exception as e:
+                    logger.warning(f"[RISK-V2] record_order_placed (auto) failed: {e}")
             # trade is None (risk block / veto / other order error) or a placed trade —
             # either way, stop trying further signals this cycle.
             break
@@ -422,6 +501,12 @@ class FullTradingBot(TradingBot):
             asyncio.create_task(self.tg.alert_bot_resumed())
 
         stats = self.trade_manager.get_stats()
+        # spec_v1 risk counters roll forward every cycle (day/week boundary + baseline
+        # seed) so the §13.1 block stays live even though it isn't gating orders yet.
+        try:
+            self._risk_v2.roll_boundaries(balance=state_store.get("balance"))
+        except Exception as e:
+            logger.warning(f"[RISK-V2] roll_boundaries failed: {e}")
         state_store.update({
             "signals": signals_this_cycle,
             "trades": self.trade_manager.trades,
@@ -430,6 +515,10 @@ class FullTradingBot(TradingBot):
             "risk": self.build_risk(),
             "config": self.build_config(),
             "account_type": self.cfg.account_type,
+            # ── §13.1 additive fields — see build_risk_v2/build_state_machine_v2 docstrings ──
+            "risk_v2": self.build_risk_v2(),
+            **self.build_state_machine_v2(),
+            "martingale_warning": self.build_martingale_warning(),
         })
 
         # Learn from results frequently (trades come slowly under one-at-a-time Martingale)
@@ -460,6 +549,10 @@ class FullTradingBot(TradingBot):
             "account_type": state_store["account_type"],
             "activity": state_store["activity"],
             "activity_log": state_store["activity_log"],
+            "risk_v2": state_store.get("risk_v2"),
+            "state_machine": state_store.get("state_machine"),
+            "global_state": state_store.get("global_state"),
+            "martingale_warning": state_store.get("martingale_warning"),
         }})
 
     # ── Command handler from WebSocket ──
@@ -544,6 +637,59 @@ class FullTradingBot(TradingBot):
                 "stats": self.trade_manager.get_stats() if self.trade_manager else {},
                 "risk": self.build_risk(),
             }})
+        elif cmd == "set_pairs":
+            pairs = kwargs.get("enabled_pairs") or []
+            valid = [p for p in pairs if isinstance(p, str) and _is_known_pair(p)]
+            invalid = [p for p in pairs if p not in valid]
+            if invalid:
+                await broadcast({"type": "error", "data": {
+                    "message": f"set_pairs rejected unknown pair(s): {', '.join(map(str, invalid))}"}})
+            if not valid:
+                logger.warning("[CMD] set_pairs: no valid pairs in payload — ignored")
+                return
+            self.cfg.enabled_pairs = valid
+            save_runtime_config(self.cfg)
+            self._need_resolve = True  # trigger resolve_assets() next cycle against the new list
+            logger.info(f"[CMD] enabled_pairs set to {valid}")
+            await self._push_settings()
+
+        elif cmd == "set_auto_stop":
+            enabled = kwargs.get("enabled")
+            drawdown_pct = kwargs.get("drawdown_pct")
+            if enabled is not None:
+                self.cfg.auto_stop_enabled = bool(enabled)
+            if drawdown_pct is not None:
+                try:
+                    self.cfg.auto_stop_drawdown_pct = max(5.0, min(50.0, float(drawdown_pct)))
+                except (TypeError, ValueError):
+                    pass
+            self._risk_v2.set_auto_stop(self.cfg.auto_stop_enabled, self.cfg.auto_stop_drawdown_pct)
+            save_runtime_config(self.cfg)
+            logger.info(f"[CMD] auto_stop enabled={self.cfg.auto_stop_enabled} "
+                        f"drawdown_pct={self.cfg.auto_stop_drawdown_pct}")
+            await self._push_settings()
+
+        elif cmd == "reset_equity_baseline":
+            bal = state_store.get("balance", 0)
+            self._risk_v2.reset_equity_baseline(bal)
+            logger.info(f"[CMD] equity baseline reset to {bal}")
+            await broadcast({"type": "update", "data": {"risk_v2": self.build_risk_v2()}})
+
+        elif cmd == "set_martingale":
+            enabled = bool(kwargs.get("enabled", False))
+            ack_risk = bool(kwargs.get("ack_risk", False))
+            ok, reason = MartingaleModule.validate_toggle(enabled, ack_risk)
+            if not ok:
+                logger.warning(f"[CMD] set_martingale rejected: {reason}")
+                await broadcast({"type": "error", "data": {"message": reason}})
+                return
+            self.cfg.martingale_enabled = enabled
+            self.cfg.martingale_ack_risk = ack_risk
+            save_runtime_config(self.cfg)
+            logger.info(f"[CMD] martingale_enabled={enabled} ack_risk={ack_risk}")
+            await self._push_settings()
+            await broadcast({"type": "update", "data": {"martingale_warning": self.build_martingale_warning()}})
+
         elif cmd == "manual_trade":
             asset = kwargs.get("asset", "")
             direction = kwargs.get("direction", "")
@@ -554,6 +700,11 @@ class FullTradingBot(TradingBot):
             if trade:
                 state_store["trades"] = self.trade_manager.trades
                 state_store["risk"] = self.build_risk()
+                # spec_v1 §13.1 counters — parallel bookkeeping only, does not gate the live order
+                try:
+                    self._risk_v2.record_order_placed()
+                except Exception as e:
+                    logger.warning(f"[RISK-V2] record_order_placed (manual) failed: {e}")
                 await broadcast({"type": "new_trade", "data": trade})
                 await broadcast({"type": "update", "data": {
                     "trades": self.trade_manager.trades,
@@ -784,6 +935,13 @@ class FullTradingBot(TradingBot):
                     self.log_activity(icon, f"ปิดไม้ {t['asset']} {t['direction']} → {t['result']} ({pnl:+.2f})",
                                       level="error" if t["result"] == "LOSS" else "info", phase="result")
                     asyncio.create_task(self.tg.alert_result(t, today_stats))
+                    # spec_v1 §13.1 counters — parallel bookkeeping only, does not gate the live
+                    # order. count_streak mirrors legacy's own consecutive_losses field, which
+                    # trading_engine._apply_close() only increments for source == "auto".
+                    try:
+                        self._risk_v2.record_order_result(pnl, t["result"], count_streak=(t.get("source") == "auto"))
+                    except Exception as e:
+                        logger.warning(f"[RISK-V2] record_order_result failed: {e}")
                 # Force-expired (unresolved, slot freed): notify so the user isn't left guessing
                 elif t.get("status") == "expired":
                     self.log_activity("⏰", f"ออเดอร์ค้าง {t['asset']} {t['direction']} — เคลียร์ช่องแล้ว",
@@ -795,6 +953,13 @@ class FullTradingBot(TradingBot):
                 logger.info(f"[SYNC] Broadcasting external trade {t['asset']} {t['direction']}")
                 if t.get("status") == "open":
                     asyncio.create_task(self.tg.alert_trade_open(t))
+                    # spec_v1 §13.1 counters — trade opened directly on IQ Option's own web/app
+                    # UI, discovered here for the first time as still-open; its eventual close
+                    # will be captured by drain_pending_alerts() above on a later loop.
+                    try:
+                        self._risk_v2.record_order_placed()
+                    except Exception as e:
+                        logger.warning(f"[RISK-V2] record_order_placed (web) failed: {e}")
                 await broadcast({"type": "new_trade", "data": t})
 
             # always push a fresh snapshot so balance / open count / stats stay current

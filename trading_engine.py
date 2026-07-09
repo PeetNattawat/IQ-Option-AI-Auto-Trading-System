@@ -107,7 +107,14 @@ class TradingConfig:
 
     # Martingale money management
     # When off, every auto trade uses the flat trade_amount stake.
-    martingale_enabled: bool = True
+    # SAFETY: this default MUST be False. Peet's Project Brief §2b: "martingale_enabled: false
+    # เป็นค่าเริ่มต้นที่แก้ไม่ได้ผ่าน config ธรรมดา" — Martingale must never be on by default,
+    # including when TradingConfig() is constructed bare (missing/corrupt config.json, disaster
+    # recovery, a fresh deploy, a diagnostic script). Do not rely on config.json alone to keep
+    # this off — apply_runtime_config()/RUNTIME_FIELDS also only ever *overwrite* this default
+    # when the key is present in the loaded dict; if it's absent, this dataclass default is what
+    # actually governs the bot, so it must be safe on its own. See bug-143 in .wolf/buglog.json.
+    martingale_enabled: bool = False
     martingale_base: float = 50.0       # step 1 stake
     martingale_multiplier: float = 2.0  # each loss multiplies the next stake
     martingale_max_steps: int = 4       # 50 -> 100 -> 200 -> 400, then reset
@@ -125,7 +132,28 @@ class TradingConfig:
     trade_digital: bool = True          # also scan/trade DIGITAL options — real forex usually lives here
     min_payout: float = 0.70            # only trade pairs paying at least this (e.g. 0.70 = 70%)
 
+    # ── Spec-overhaul fields (San's Architecture Notes, outputs/01_san-iqoption-spec-overhaul.md) ──
+    # ADR-1: strategy_mode gates which engine actually places live trades. Defaults to "legacy"
+    # here (NOT "spec_v1" as San's ADR-1 suggests) because spec_v1's out-of-sample backtest has
+    # not been run against real market data in this environment (Dukascopy fetch blocked from
+    # this sandbox — see data_downloader.py docstring) and Peet's explicit brief note says
+    # "ไม่แตะ production trading จนกว่าจะผ่านเกณฑ์ตามสเปค". Flip to "spec_v1" only after Vector's
+    # Gate 3 confirms a real out-of-sample backtest pass.
+    strategy_mode: str = "legacy"        # "legacy" | "spec_v1"
+    stake_pct: float = 1.5               # spec_v1 RiskManager: % of CURRENT balance per trade
+    weekly_loss_limit_pct: float = 10.0
+    daily_loss_limit_pct: float = 4.0
+    signal_cooldown_minutes: int = 15
+    auto_stop_enabled: bool = True
+    auto_stop_drawdown_pct: float = 30.0   # dashboard-settable, default only (not hard-coded)
+    enabled_pairs: list = None            # dashboard-selectable pair list; default = EUR/USD only
+    default_pair: str = "EURUSD"
+    martingale_ack_risk: bool = False     # NEW — must be True in the SAME payload as
+                                           # martingale_enabled=True to actually enable it (ADR-4)
+
     def __post_init__(self):
+        if self.enabled_pairs is None:
+            self.enabled_pairs = [self.default_pair]
         if self.assets is None:
             self.assets = ["EURUSD", "GBPUSD", "AUDUSD", "USDJPY", "EURGBP"]
         # name -> instrument kind ("digital" | "binary" | "turbo"), filled by resolve_assets

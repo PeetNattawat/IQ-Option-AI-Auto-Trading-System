@@ -95,12 +95,44 @@
   .stat-table td { font-family: var(--sans); }
   .stat-table .wr { font-family: var(--mono); font-size: 16px; font-weight: 700; }
 
-  .risk-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+  .risk-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   @media (max-width: 700px) { .risk-grid { grid-template-columns: repeat(2, 1fr); } }
   .risk-card { background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 13px 15px; }
   .risk-card .lbl { font-size: 11.5px; color: var(--muted2); margin-bottom: 7px; }
   .risk-card .val { font-family: var(--mono); font-size: 24px; font-weight: 700; }
   .risk-card .val small { font-size: 13px; color: var(--muted); font-weight: 400; }
+  .risk-card .val.neg-text { color: var(--red); }
+  .risk-card .val.cooldown-val { color: var(--amber); }
+  .risk-card .val.hardstop-val { color: var(--red); }
+
+  /* STATE MACHINE */
+  .sm-pill { font-family: var(--mono); font-size: 11px; font-weight: 700; padding: 4px 12px; border-radius: 14px; border: 1px solid; display: inline-flex; align-items: center; gap: 5px; }
+  .sm-idle { color: var(--muted2); border-color: var(--border2); background: var(--bg2); }
+  .sm-check_filters, .sm-check_signal { color: var(--blue); border-color: var(--blue); background: rgba(59,130,246,.1); }
+  .sm-place_order { color: var(--amber); border-color: var(--amber); background: rgba(245,158,11,.1); }
+  .sm-in_trade { color: var(--green); border-color: var(--green); background: rgba(16,185,129,.1); }
+  .sm-error { color: var(--red); border-color: var(--red); background: rgba(239,68,68,.1); }
+  .sm-kill { color: #fff; border-color: var(--red); background: var(--red); animation: blink 1s infinite; }
+  .global-state-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-size: 13px; }
+
+  .kill-banner { display: none; position: sticky; top: 0; z-index: 50; background: var(--red); color: #fff; font-weight: 700; font-size: 15px; text-align: center; padding: 12px 16px; border-radius: 10px; margin-bottom: 14px; box-shadow: 0 0 0 3px rgba(239,68,68,.3); }
+  .kill-banner.show { display: block; }
+
+  /* MARTINGALE WARNING */
+  .mg-warning-banner { display: none; background: rgba(239,68,68,.12); border: 1px solid var(--red); color: var(--red); font-size: 13px; font-weight: 600; padding: 12px 16px; border-radius: 10px; margin-bottom: 14px; line-height: 1.6; }
+  .mg-warning-banner.show { display: block; }
+  .ack-box { display: none; margin-top: 8px; padding: 10px 12px; background: rgba(239,68,68,.08); border: 1px solid var(--red); border-radius: 8px; font-size: 12.5px; line-height: 1.5; }
+  .ack-box.show { display: block; }
+  .ack-box label { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+
+  /* PAIR SELECTOR */
+  .pair-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 8px; margin: 4px 0 4px; }
+  .pair-chip { display: flex; align-items: center; gap: 6px; padding: 8px 10px; background: var(--bg2); border: 1px solid var(--border2); border-radius: 8px; font-size: 12.5px; cursor: pointer; }
+  .pair-chip input { accent-color: var(--cyan); }
+  .form-error { color: var(--red); font-size: 12px; margin-top: 8px; display: none; }
+  .form-error.show { display: block; }
+  .detail-btn { font-family: var(--sans); font-size: 10px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--border2); background: var(--bg2); color: var(--muted2); cursor: pointer; margin-left: 6px; }
+  .detail-btn:hover { background: var(--bg3); }
 
   /* FORMS */
   .field { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
@@ -178,6 +210,9 @@
   </div>
 </div>
 
+<div class="kill-banner" id="kill-banner">⛔ บอทถูกสั่งปิด (KILL) — หยุดเทรดทั้งหมดแล้ว ต้อง restart ด้วยตนเองเท่านั้น</div>
+<div class="mg-warning-banner" id="mg-warning-banner"></div>
+
 <div class="tabs">
   <div class="tab active" data-tab="monitor" onclick="switchTab('monitor')">📊 Monitor</div>
   <div class="tab" data-tab="settings" onclick="switchTab('settings')">⚙️ ตั้งค่า</div>
@@ -197,6 +232,19 @@
     <div class="status-meta">updated: <b id="updated-at">-</b> &nbsp;·&nbsp; bot: <b id="bot-status">-</b></div>
     <div class="progress-head"><span>กำไรวันนี้</span><span><b id="profit-today">0</b> / <span id="profit-target">200</span></span></div>
     <div class="progress-bar"><div class="progress-fill" id="profit-fill"></div></div>
+  </div>
+
+  <!-- STATE MACHINE -->
+  <div class="card">
+    <h2>สถานะเครื่องจักร (State Machine)</h2>
+    <div class="global-state-row">
+      <span>สถานะรวม:</span>
+      <span class="pill pill-gray" id="pill-global-state">-</span>
+    </div>
+    <table>
+      <thead><tr><th>คู่เงิน</th><th>State</th><th>ตั้งแต่</th><th>เหตุผล</th></tr></thead>
+      <tbody id="state-machine-body"><tr><td colspan="4" class="empty">รอข้อมูลจากบอท...</td></tr></tbody>
+    </table>
   </div>
 
   <!-- กิจกรรมบอท -->
@@ -273,10 +321,15 @@
   <div class="card">
     <h2>ตัวนับความเสี่ยง (Risk Counters)</h2>
     <div class="risk-grid">
-      <div class="risk-card"><div class="lbl">ไม้ที่เปิดอยู่</div><div class="val"><span id="r-open">0</span> <small>/ <span id="r-open-max">3</span></small></div></div>
-      <div class="risk-card"><div class="lbl">เทรดวันนี้</div><div class="val"><span id="r-day">0</span> <small>/ <span id="r-day-max">20</span></small></div></div>
-      <div class="risk-card"><div class="lbl">แพ้ติดกัน</div><div class="val"><span id="r-consec">0</span> <small>/ <span id="r-consec-max">4</span></small></div></div>
-      <div class="risk-card"><div class="lbl">Daily loss</div><div class="val" id="r-dloss">0.00</div></div>
+      <div class="risk-card"><div class="lbl">ไม้ที่เปิดอยู่</div><div class="val"><span id="r-open">0</span> <small>/ <span id="r-open-max">1</span></small></div></div>
+      <div class="risk-card"><div class="lbl">เทรดวันนี้</div><div class="val"><span id="r-day">0</span> <small>/ <span id="r-day-max">5</span></small></div></div>
+      <div class="risk-card"><div class="lbl">แพ้ติดกัน</div><div class="val"><span id="r-consec">0</span> <small>/ <span id="r-consec-max">3</span></small></div></div>
+      <div class="risk-card"><div class="lbl">Stake ปัจจุบัน</div><div class="val" id="r-stake" style="font-size:18px">-</div></div>
+      <div class="risk-card"><div class="lbl">Daily P&amp;L</div><div class="val" id="r-dpnl">0%</div><div class="lbl" style="margin-top:4px">ลิมิต <span id="r-dpnl-max">-4.0%</span></div></div>
+      <div class="risk-card"><div class="lbl">Weekly P&amp;L</div><div class="val" id="r-wpnl">0%</div><div class="lbl" style="margin-top:4px">ลิมิต <span id="r-wpnl-max">-10.0%</span></div></div>
+      <div class="risk-card"><div class="lbl">Cooldown (หลังแพ้)</div><div class="val" id="r-cooldown" style="font-size:18px">ไม่มี</div></div>
+      <div class="risk-card"><div class="lbl">Hard-Stop</div><div class="val" id="r-hardstop" style="font-size:16px">ปกติ</div></div>
+      <div class="risk-card"><div class="lbl">Auto-Stop</div><div class="val" id="r-autostop" style="font-size:16px">-</div></div>
     </div>
   </div>
 
@@ -310,10 +363,13 @@
   </div>
 
   <div class="card">
-    <h2>การจัดการเงิน (Martingale)</h2>
+    <h2>การจัดการเงิน (Martingale) <span class="hint">⚠️ ขัดกับสเปคของบอทนี้ — ปิดเป็นค่าเริ่มต้นเสมอ</span></h2>
     <div class="field">
-      <div class="f-label">เปิด Martingale<span class="sub">แพ้แล้วเพิ่มเงินไม้ถัดไปเพื่อกู้คืน</span></div>
-      <label class="toggle"><input type="checkbox" id="set-mg-enabled"><span class="slider"></span></label>
+      <div class="f-label">เปิด Martingale<span class="sub">แพ้แล้วเพิ่มเงินไม้ถัดไปเพื่อกู้คืน — ความเสี่ยงสูง ล้างพอร์ตเร็วกว่าปกติ</span></div>
+      <label class="toggle"><input type="checkbox" id="set-mg-enabled" onchange="onMgToggle()"><span class="slider"></span></label>
+    </div>
+    <div class="ack-box" id="mg-ack-box">
+      <label><input type="checkbox" id="mg-ack-risk"> ฉันเข้าใจความเสี่ยง — Martingale ขัดกับสเปคของบอทนี้ เพราะ payout ต่ำกว่า 100% ทำให้ล้างพอร์ตได้เร็วกว่าปกติ การเปิดใช้เป็นการตัดสินใจของฉันเอง ไม่ใช่คำแนะนำจากระบบ</label>
     </div>
     <div class="field">
       <div class="f-label">เงินไม้แรก (ฐาน)<span class="sub">จำนวนเงินเริ่มต้นต่อไม้</span></div>
@@ -328,6 +384,40 @@
       <input type="number" id="set-mg-steps" min="1" max="8" step="1" value="4">
     </div>
     <div class="form-note" id="set-mg-preview"></div>
+    <div class="form-actions">
+      <button class="btn btn-save" onclick="saveMartingale()">💾 บันทึก Martingale</button>
+      <span class="saved-flash" id="mg-saved-flash">✓ บันทึกแล้ว</span>
+    </div>
+    <div class="form-error" id="mg-error"></div>
+  </div>
+
+  <div class="card">
+    <h2>Auto-Stop ป้องกันเงินทุน <span class="hint">กลไกป้องกันความเสี่ยงหลัก</span></h2>
+    <div class="field">
+      <div class="f-label">เปิดใช้งาน Auto-Stop<span class="sub">หยุดบอทอัตโนมัติเมื่อทุนลดเกิน % ที่กำหนด — แนะนำให้เปิดไว้เสมอ</span></div>
+      <label class="toggle"><input type="checkbox" id="set-autostop-enabled" checked onchange="onAutoStopToggle()"><span class="slider"></span></label>
+    </div>
+    <div class="field">
+      <div class="f-label">% ทุนที่ยอมขาดทุนก่อนหยุด<span class="sub">คำนวณจาก baseline equity · ตั้งได้ 5-50% (ค่าเริ่มต้น 30%)</span></div>
+      <input type="number" id="set-autostop-pct" min="5" max="50" step="1" value="30">
+    </div>
+    <div class="status-meta" id="autostop-status">-</div>
+    <div class="form-actions">
+      <button class="btn btn-save" onclick="saveAutoStop()">💾 บันทึก Auto-Stop</button>
+      <span class="saved-flash" id="autostop-saved-flash">✓ บันทึกแล้ว</span>
+      <button class="btn" style="color:var(--muted2);border-color:var(--border2)" onclick="resetEquityBaseline()">↺ รีเซ็ต baseline</button>
+    </div>
+    <div class="form-note">Baseline = ทุนตอนบอทเชื่อมต่อสำเร็จครั้งแรกหลังเปิดใช้ฟีเจอร์นี้ · รีเซ็ตเฉพาะเมื่อฝาก/ถอนเงินจริงเท่านั้น (บันทึกลง audit log)</div>
+  </div>
+
+  <div class="card">
+    <h2>ตัวเลือกคู่เทรด (Trading Pairs) <span class="hint">เลือกได้หลายคู่ — ค่าเริ่มต้น EUR/USD</span></h2>
+    <div class="pair-grid" id="pair-grid"></div>
+    <div class="form-error" id="pair-error"></div>
+    <div class="form-actions">
+      <button class="btn btn-save" onclick="savePairs()">💾 บันทึกคู่เทรด</button>
+      <span class="saved-flash" id="pair-saved-flash">✓ บันทึกแล้ว</span>
+    </div>
   </div>
 
   <div class="card">
@@ -374,10 +464,17 @@
 
 <script>
 let ws = null, reconnectTimer = null;
-let S = { signals: [], trades: [], stats: {}, risk: {}, config: {}, balance: 0, status: '-', account_type: 'PRACTICE', activity: {}, activity_log: [] };
+let S = {
+  signals: [], trades: [], stats: {}, risk: {}, config: {}, balance: 0, status: '-', account_type: 'PRACTICE',
+  activity: {}, activity_log: [],
+  state_machine: {}, global_state: 'RUNNING', trend: {}, martingale_warning: null
+};
 let settingsTouched = false;   // don't clobber settings inputs while editing
+let autoStopTouched = false;   // don't clobber auto-stop inputs while editing
+let pairsTouched = false;      // don't clobber pair checkboxes while editing
 let statPeriod = 'today';
 let lastUpdateMs = 0;          // last time we received any data from the bot (staleness check)
+const PAIR_LIST = ['EURUSD','GBPUSD','USDJPY','AUDUSD','USDCHF','NZDUSD','EURJPY','EURGBP'];
 
 const $ = id => document.getElementById(id);
 function fmtTime(iso) { const d = new Date(iso); return isNaN(d) ? '-' : d.toLocaleTimeString('th-TH'); }
@@ -428,8 +525,9 @@ function switchAccount(acc) {
 }
 
 function saveSettings() {
+  // martingale_enabled/ack_risk are sent together via the dedicated saveMartingale()
+  // flow below (set_martingale cmd) — never bundled here, per API contract §13.2 ADR-4.
   const settings = {
-    martingale_enabled: $('set-mg-enabled').checked,
     martingale_base: parseFloat($('set-mg-base').value),
     martingale_multiplier: parseFloat($('set-mg-mult').value),
     martingale_max_steps: parseInt($('set-mg-steps').value),
@@ -441,10 +539,79 @@ function saveSettings() {
     daily_profit_target: parseFloat($('set-target').value),
     daily_loss_limit: parseFloat($('set-loss-limit').value),
   };
-  if (settings.martingale_enabled) settings.trade_amount = settings.martingale_base;
   sendCmd('update_settings', { settings });
   settingsTouched = false;
   const f = $('saved-flash'); f.classList.add('show'); setTimeout(() => f.classList.remove('show'), 1800);
+}
+
+function onMgToggle() {
+  syncMgAckVisibility();
+}
+function syncMgAckVisibility() {
+  $('mg-ack-box').classList.toggle('show', $('set-mg-enabled').checked);
+}
+
+function saveMartingale() {
+  const enabled = $('set-mg-enabled').checked;
+  const ack = $('mg-ack-risk').checked;
+  const err = $('mg-error');
+  if (enabled && !ack) {
+    err.textContent = 'ต้องติ๊กยืนยันว่าเข้าใจความเสี่ยงก่อนเปิด Martingale';
+    err.classList.add('show');
+    return;
+  }
+  if (enabled && !confirm('⚠️ ยืนยันเปิด Martingale?\nระบบนี้ขัดกับสเปคของบอทและเสี่ยงล้างพอร์ตเร็วกว่าปกติ (payout ต่ำกว่า 100%)\n\nต้องการเปิดใช้งานจริงหรือไม่?')) return;
+  err.classList.remove('show');
+  sendCmd('set_martingale', { enabled, ack_risk: enabled ? ack : false });
+  const f = $('mg-saved-flash'); f.classList.add('show'); setTimeout(() => f.classList.remove('show'), 1800);
+}
+
+function onAutoStopToggle() {
+  autoStopTouched = true;
+  const cb = $('set-autostop-enabled');
+  if (!cb.checked) {
+    const ok = confirm('⚠️ ปิด Auto-Stop จะทำให้บอทไม่มีระบบหยุดอัตโนมัติเมื่อทุนลดเกินเกณฑ์ — เสี่ยงขาดทุนต่อเนื่องโดยไม่มีการป้องกัน\n\nยืนยันปิด Auto-Stop?');
+    if (!ok) { cb.checked = true; return; }
+  }
+}
+
+function saveAutoStop() {
+  const enabled = $('set-autostop-enabled').checked;
+  let pct = parseFloat($('set-autostop-pct').value);
+  if (isNaN(pct)) pct = 30;
+  pct = Math.min(50, Math.max(5, pct));
+  $('set-autostop-pct').value = pct;
+  sendCmd('set_auto_stop', { enabled, drawdown_pct: pct });
+  autoStopTouched = false;
+  const f = $('autostop-saved-flash'); f.classList.add('show'); setTimeout(() => f.classList.remove('show'), 1800);
+}
+
+function resetEquityBaseline() {
+  if (!confirm('รีเซ็ต baseline equity เป็นยอดเงินปัจจุบัน?\nใช้เมื่อมีการฝาก/ถอนเงินจริงเท่านั้น — การรีเซ็ตจะถูกบันทึกไว้ใน system log')) return;
+  sendCmd('reset_equity_baseline');
+}
+
+function renderPairSelector() {
+  if (pairsTouched) return;
+  const enabled = (S.config && S.config.enabled_pairs && S.config.enabled_pairs.length) ? S.config.enabled_pairs : ['EURUSD'];
+  $('pair-grid').innerHTML = PAIR_LIST.map(p => {
+    const isChecked = enabled.includes(p);
+    return `<label class="pair-chip"><input type="checkbox" value="${p}" ${isChecked ? 'checked' : ''} onchange="pairsTouched=true">${p.slice(0,3)}/${p.slice(3)}</label>`;
+  }).join('');
+}
+
+function savePairs() {
+  const checked = Array.from(document.querySelectorAll('.pair-grid input:checked')).map(el => el.value);
+  const err = $('pair-error');
+  if (!checked.length) {
+    err.textContent = 'ต้องเลือกอย่างน้อย 1 คู่เทรด';
+    err.classList.add('show');
+    return;
+  }
+  err.classList.remove('show');
+  sendCmd('set_pairs', { enabled_pairs: checked });
+  pairsTouched = false;
+  const f = $('pair-saved-flash'); f.classList.add('show'); setTimeout(() => f.classList.remove('show'), 1800);
 }
 
 function srcLabel(source) { return source === 'auto' ? 'Bot' : 'Manual'; }
@@ -562,6 +729,132 @@ function renderMartingale() {
   $('mg-note').textContent = `แต่ละคู่มีบันไดทบของตัวเอง · เสี่ยงสูงสุด/คู่ (แพ้ครบ ${seq.length} ไม้) = ${num(total, 0)} · ${activeTxt}`;
 }
 
+function fmtTimeTH(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? '-' : d.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Bangkok' });
+}
+
+const SM_LABELS = { IDLE: 'IDLE', CHECK_FILTERS: 'CHECK FILTERS', CHECK_SIGNAL: 'CHECK SIGNAL', PLACE_ORDER: 'PLACE ORDER', IN_TRADE: 'IN TRADE', ERROR: 'ERROR', KILL: 'KILL' };
+function smPillClass(state) {
+  const s = (state || 'IDLE').toUpperCase();
+  if (s === 'KILL' || s === 'KILLED') return 'sm-kill';
+  if (s === 'ERROR') return 'sm-error';
+  if (s === 'IN_TRADE') return 'sm-in_trade';
+  if (s === 'PLACE_ORDER') return 'sm-place_order';
+  if (s === 'CHECK_FILTERS' || s === 'CHECK_SIGNAL') return 'sm-' + s.toLowerCase();
+  return 'sm-idle';
+}
+
+function renderStateMachine() {
+  const gs = (S.global_state || 'RUNNING').toUpperCase();
+  const pg = $('pill-global-state');
+  pg.className = 'pill ' + (gs === 'KILLED' ? 'pill-red' : gs === 'ERROR' ? 'pill-amber' : 'pill-green');
+  pg.innerHTML = `<span class="pdot"></span> ${gs}`;
+  $('kill-banner').classList.toggle('show', gs === 'KILLED');
+
+  const sm = S.state_machine || {};
+  const rows = Object.entries(sm);
+  $('state-machine-body').innerHTML = rows.length
+    ? rows.map(([pair, s]) => `<tr>
+        <td><span class="asset">${pair}</span></td>
+        <td><span class="sm-pill ${smPillClass(s.state)}">${SM_LABELS[(s.state || '').toUpperCase()] || s.state || '-'}</span></td>
+        <td>${fmtTimeTH(s.since)}</td>
+        <td><span class="dec-reason">${s.reason || '-'}</span></td>
+      </tr>`).join('')
+    : '<tr><td colspan="4" class="empty">รอข้อมูลจากบอท...</td></tr>';
+}
+
+function renderMgWarningBanner() {
+  const banner = $('mg-warning-banner');
+  if (S.martingale_warning) { banner.textContent = S.martingale_warning; banner.classList.add('show'); }
+  else banner.classList.remove('show');
+}
+
+function fmtCountdown(untilIso) {
+  if (!untilIso) return null;
+  const until = new Date(untilIso).getTime();
+  if (isNaN(until)) return null;
+  const diff = Math.max(0, Math.round((until - Date.now()) / 1000));
+  if (diff <= 0) return null;
+  const m = Math.floor(diff / 60), s = diff % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function renderRiskCounters() {
+  // BUG-1 fix (Iris QA gate-2, 2026-07-09): open/day/consec counters must come from the
+  // LEGACY `S.risk` block — that's what the live `strategy_mode="legacy"` engine actually
+  // updates on every real trade. `S.risk_v2` (spec_v1 RiskManager, main.py `_risk_v2`) is
+  // NOT fed real trade events yet (no record_order_placed/record_order_result calls anywhere
+  // in main.py as of this session — only roll_boundaries/auto_stop touch it), so it would
+  // always show a stale/zero open-positions count if used as primary source here. The 4
+  // fields with NO legacy equivalent (daily_pnl_pct/weekly_pnl_pct/cooldown/hard_stop/auto_stop)
+  // only ever exist under `risk_v2`, per main.py build_risk_v2()/risk_manager.py to_state_dict().
+  const legacy = S.risk || {};
+  const v2 = S.risk_v2 || {};
+  $('r-open').textContent = legacy.open ?? v2.open_positions ?? 0;
+  $('r-day').textContent = legacy.today_trades ?? v2.trades_today ?? 0;
+  $('r-day-max').textContent = legacy.max_day_trades ?? v2.max_trades_per_day ?? 5;
+  $('r-consec').textContent = legacy.consec_losses ?? v2.consecutive_losses ?? 0;
+  $('r-consec-max').textContent = legacy.max_consec ?? v2.max_consecutive_losses ?? 3;
+
+  const stakePct = (S.config && S.config.stake_pct) ?? 1.5;
+  const stakeAmt = (Number(S.balance) || 0) * stakePct / 100;
+  $('r-stake').textContent = `${num(stakeAmt)} (${num(stakePct, 1)}%)`;
+
+  const dPnl = v2.daily_pnl_pct ?? 0, dLimit = v2.daily_loss_limit_pct ?? 4;
+  const dEl = $('r-dpnl');
+  dEl.textContent = num(dPnl, 2) + '%';
+  dEl.className = 'val' + (dPnl < 0 ? ' neg-text' : '');
+  $('r-dpnl-max').textContent = '-' + num(dLimit, 1) + '%';
+
+  const wPnl = v2.weekly_pnl_pct ?? 0, wLimit = v2.weekly_loss_limit_pct ?? 10;
+  const wEl = $('r-wpnl');
+  wEl.textContent = num(wPnl, 2) + '%';
+  wEl.className = 'val' + (wPnl < 0 ? ' neg-text' : '');
+  $('r-wpnl-max').textContent = '-' + num(wLimit, 1) + '%';
+
+  const cd = fmtCountdown(v2.signal_cooldown_until);
+  $('r-cooldown').textContent = cd || 'ไม่มี';
+  $('r-cooldown').className = 'val' + (cd ? ' cooldown-val' : '');
+
+  const hs = v2.hard_stop_until;
+  $('r-hardstop').textContent = hs === 'next_day' ? 'หยุดถึงวันถัดไป' : hs === 'next_week' ? 'หยุดถึงสัปดาห์ถัดไป' : 'ปกติ';
+  $('r-hardstop').className = 'val' + (hs ? ' hardstop-val' : '');
+
+  const as = v2.auto_stop || {};
+  const asEnabled = as.enabled !== undefined ? as.enabled : true;
+  const asEl = $('r-autostop');
+  asEl.textContent = as.triggered ? '⛔ TRIGGERED' : (asEnabled ? `เปิด (${num(as.current_drawdown_pct ?? 0, 1)}% / ${num(as.drawdown_pct ?? 30, 0)}%)` : 'ปิดใช้งาน');
+  asEl.className = 'val' + (as.triggered ? ' hardstop-val' : '');
+}
+setInterval(() => { if (S && (S.risk || S.risk_v2)) renderRiskCounters(); }, 1000);
+
+function tradeHasDetail(t) {
+  return !!(t.pattern_type || t.trend_status || t.rsi_m5 !== undefined || t.atr_m5 !== undefined ||
+    t.ema20_m15 !== undefined || t.ema50_m15 !== undefined || t.ema20_m5 !== undefined || t.latency_ms !== undefined);
+}
+function tradeDetailRow(t, idx) {
+  if (!tradeHasDetail(t)) return '';
+  const parts = [];
+  if (t.pattern_type) parts.push(`<span>Pattern: <b style="color:var(--text)">${t.pattern_type}</b></span>`);
+  if (t.trend_status) parts.push(`<span>Trend(M15): <b style="color:var(--text)">${t.trend_status}</b></span>`);
+  if (t.rsi_m5 !== undefined) parts.push(`<span>RSI: <b style="color:var(--text)">${num(t.rsi_m5, 1)}</b></span>`);
+  if (t.atr_m5 !== undefined) parts.push(`<span>ATR: <b style="color:var(--text)">${num(t.atr_m5, 5)}</b></span>`);
+  if (t.ema20_m15 !== undefined) parts.push(`<span>EMA20(M15): <b style="color:var(--text)">${num(t.ema20_m15, 5)}</b></span>`);
+  if (t.ema50_m15 !== undefined) parts.push(`<span>EMA50(M15): <b style="color:var(--text)">${num(t.ema50_m15, 5)}</b></span>`);
+  if (t.ema20_m5 !== undefined) parts.push(`<span>EMA20(M5): <b style="color:var(--text)">${num(t.ema20_m5, 5)}</b></span>`);
+  if (t.latency_ms !== undefined) parts.push(`<span>Latency: <b style="color:var(--text)">${t.latency_ms} ms</b></span>`);
+  return `<tr class="trade-detail" id="detail-${idx}" style="display:none">
+    <td colspan="6" style="background:var(--bg2)">
+      <div style="font-size:11.5px;color:var(--muted2);display:flex;gap:14px;flex-wrap:wrap;padding:6px 4px">${parts.join('')}</div>
+    </td>
+  </tr>`;
+}
+function toggleTradeDetail(idx) {
+  const row = $('detail-' + idx);
+  if (row) row.style.display = row.style.display === 'none' ? '' : 'none';
+}
+
 function render() {
   const st = (S.status || '-').toUpperCase();
   const ps = $('pill-status'), running = S.status === 'running';
@@ -587,6 +880,8 @@ function render() {
   renderActivity();
   renderDecisions();
   renderMartingale();
+  renderStateMachine();
+  renderMgWarningBanner();
 
   if (S.signals && S.signals.length) {
     $('signals-body').innerHTML = S.signals.map(s => {
@@ -622,10 +917,11 @@ function render() {
   const today = new Date().toDateString();
   const todays = (S.trades || []).filter(t => new Date(t.open_time).toDateString() === today).reverse();
   if (todays.length) {
-    $('trades-body').innerHTML = todays.slice(0, 8).map(t => {
+    $('trades-body').innerHTML = todays.slice(0, 8).map((t, i) => {
       const pnl = t.pnl;
       const pnlHtml = pnl === null || pnl === undefined ? '-' : `<span class="${pnl >= 0 ? 'pnl-pos' : 'pnl-neg'}">${num(pnl)}</span>`;
-      return `<tr><td>${fmtDateTime(t.open_time)}</td><td><span class="asset">${t.asset}</span></td><td>${sigPill(t.direction)}</td><td>${resPill(t)}</td><td class="num">${pnlHtml}</td><td>${srcPill(t.source)}</td></tr>`;
+      const detailBtn = tradeHasDetail(t) ? ` <button class="detail-btn" aria-label="ดูรายละเอียดสัญญาณ" onclick="toggleTradeDetail(${i})">ℹ</button>` : '';
+      return `<tr><td>${fmtDateTime(t.open_time)}</td><td><span class="asset">${t.asset}</span>${detailBtn}</td><td>${sigPill(t.direction)}</td><td>${resPill(t)}</td><td class="num">${pnlHtml}</td><td>${srcPill(t.source)}</td></tr>${tradeDetailRow(t, i)}`;
     }).join('');
     $('trades-note').textContent = `แสดง ${Math.min(8, todays.length)} ไม้ล่าสุด จากทั้งหมด ${todays.length} ไม้วันนี้`;
   } else {
@@ -633,13 +929,7 @@ function render() {
     $('trades-note').textContent = '';
   }
 
-  $('r-open').textContent = r.open ?? 0;
-  $('r-open-max').textContent = r.max_open ?? 3;
-  $('r-day').textContent = r.today_trades ?? 0;
-  $('r-day-max').textContent = r.max_day_trades ?? 20;
-  $('r-consec').textContent = r.consec_losses ?? 0;
-  $('r-consec-max').textContent = r.max_consec ?? 4;
-  $('r-dloss').textContent = num(r.daily_loss ?? 0);
+  renderRiskCounters();
 
   // account toggle highlight
   document.querySelectorAll('#acc-toggle button').forEach(b => b.classList.toggle('active',
@@ -648,7 +938,7 @@ function render() {
   // settings inputs (don't overwrite while user edits)
   const c = S.config || {};
   if (!settingsTouched) {
-    if (c.martingale_enabled !== undefined) $('set-mg-enabled').checked = c.martingale_enabled;
+    if (c.martingale_enabled !== undefined) { $('set-mg-enabled').checked = c.martingale_enabled; syncMgAckVisibility(); }
     if (c.martingale_base !== undefined) $('set-mg-base').value = c.martingale_base;
     if (c.martingale_multiplier !== undefined) $('set-mg-mult').value = c.martingale_multiplier;
     if (c.martingale_max_steps !== undefined) $('set-mg-steps').value = c.martingale_max_steps;
@@ -659,7 +949,20 @@ function render() {
     if (c.max_consecutive_losses !== undefined) $('set-max-consec').value = c.max_consecutive_losses;
     if (c.daily_profit_target !== undefined) $('set-target').value = c.daily_profit_target;
     if (c.daily_loss_limit !== undefined) $('set-loss-limit').value = c.daily_loss_limit;
+    // ack-risk is never restored from server state — must be re-confirmed every session
+    $('mg-ack-risk').checked = false;
   }
+
+  if (!autoStopTouched) {
+    const as = r.auto_stop || {};
+    $('set-autostop-enabled').checked = as.enabled !== undefined ? as.enabled : (c.auto_stop_enabled ?? true);
+    $('set-autostop-pct').value = as.drawdown_pct ?? c.auto_stop_drawdown_pct ?? 30;
+    $('autostop-status').innerHTML = as.triggered
+      ? '<b style="color:var(--red)">⛔ Auto-Stop ทำงานแล้ว — ทุนลดเกินเกณฑ์ ต้องรีเซ็ต baseline เพื่อเทรดต่อ</b>'
+      : `baseline: <b>${num(as.baseline_balance ?? 0)}</b> · drawdown ปัจจุบัน: <b>${num(as.current_drawdown_pct ?? 0, 1)}%</b>`;
+  }
+
+  renderPairSelector();
   updateMgPreview();
 }
 
@@ -676,6 +979,9 @@ function updateMgPreview() {
 // mark settings as being edited + live-preview martingale ladder
 ['set-mg-enabled','set-mg-base','set-mg-mult','set-mg-steps','set-conf','set-expiry','set-max-open','set-max-day','set-max-consec','set-target','set-loss-limit']
   .forEach(id => $(id).addEventListener('input', () => { settingsTouched = true; updateMgPreview(); }));
+
+// auto-stop % input: mark as being edited so live updates don't clobber it mid-typing
+$('set-autostop-pct').addEventListener('input', () => { autoStopTouched = true; });
 
 connect();
 addLog('info', 'เริ่มแดชบอร์ด — เชื่อมต่อ ws://localhost:8765');
