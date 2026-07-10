@@ -540,6 +540,13 @@ class TradeManager:
                 return json.load(f)
         except FileNotFoundError:
             return []
+        except json.JSONDecodeError:
+            logger.warning(
+                "[LEARNING] data/learning_rules.json exists but is empty or corrupted "
+                "(invalid JSON) — falling back to empty rule list. Bot will continue "
+                "startup, but check the file on disk if this persists."
+            )
+            return []
 
     def _load_step(self) -> int:
         try:
@@ -1176,6 +1183,13 @@ class LearningEngine:
             with open("data/learning_rules.json") as f:
                 existing = {r["id"]: r for r in json.load(f)}
         except FileNotFoundError:
+            existing = {}
+        except json.JSONDecodeError:
+            logger.warning(
+                "[LEARNING] data/learning_rules.json exists but is empty or corrupted "
+                "(invalid JSON) — discarding existing rules and starting fresh from "
+                "new_rules only. Check the file on disk if this persists."
+            )
             existing = {}
         for r in new_rules:
             existing[r["id"]] = r
