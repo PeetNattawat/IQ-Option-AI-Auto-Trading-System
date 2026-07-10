@@ -14,6 +14,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from dataclasses import asdict
 
+import pandas as pd
 import websockets
 from dotenv import load_dotenv
 from pathlib import Path
@@ -39,6 +40,15 @@ from telegram_bot import TelegramBot, TelegramConfig
 from risk_manager import RiskConfig, RiskManager
 from martingale import MartingaleModule, WARNING_TEXT as MARTINGALE_WARNING_TEXT
 
+# ── spec_v1 live-wiring (San's Architecture Notes, outputs/10_san-iqoption-spec-v1-live-wiring.md) ──
+from candle_store import CandleStore
+from entry_signal import EntrySignal
+from indicators_v2 import IndicatorEngineV2
+from state_machine import BotStateMachine
+from trade_logger import TradeLogger
+from trend_filter import TrendFilter
+from time_filter import TimeFilter
+
 # Known tradable pairs for set_pairs validation (spec §12 multi-pair config — not
 # hard-locked to EUR/USD, default selection only). Mirrors the FIAT whitelist logic
 # in TradingBot.resolve_assets() (trading_engine.py) so the two lists can't drift —
@@ -58,6 +68,43 @@ RUNTIME_CONFIG_PATH = Path("data/config.json")
 def _h(v) -> str:
     """Escape a dynamic value for Telegram HTML parse_mode."""
     return html.escape(str(v)) if v is not None else ""
+
+
+def _enforce_spec_v1_practice_gate(cfg: TradingConfig, tg: "TelegramBot | None" = None,
+                                    trade_logger: "TradeLogger | None" = None) -> bool:
+    """Hard safety gate (San's Architecture Notes §2) — reused verbatim at 3 call sites:
+    apply_runtime_config() [startup + dashboard update_settings], the switch_account command
+    handler, and the spec_v1 M5/M15 scheduler loop itself (defense-in-depth). If
+    strategy_mode=="spec_v1" is ever paired with an account_type other than PRACTICE, force
+    strategy_mode back to "legacy" — spec_v1 has not passed an out-of-sample backtest (spec
+    §10) and must never trade real money. Never crashes, never silently passes through.
+    Returns True if a forced fallback just happened (caller may want to alert)."""
+    if cfg.strategy_mode == "spec_v1" and cfg.account_type != "PRACTICE":
+        logger.warning(
+            f"[SAFETY-GATE] strategy_mode=spec_v1 blocked on account_type={cfg.account_type} "
+            "— spec_v1 logic ยังไม่ผ่าน out-of-sample backtest (spec §10), ห้ามเทรดเงินจริง. "
+            "Forcing strategy_mode back to 'legacy'."
+        )
+        cfg.strategy_mode = "legacy"
+        if trade_logger is not None:
+            try:
+                ts = datetime.now(ZoneInfo("Asia/Bangkok")).isoformat()
+                trade_logger.write_system_event(ts, "SAFETY_GATE_TRIPPED", {
+                    "account_type": cfg.account_type,
+                    "forced_strategy_mode": "legacy",
+                })
+            except Exception as e:
+                logger.warning(f"[SAFETY-GATE] write_system_event failed: {e}")
+        if tg is not None:
+            try:
+                asyncio.create_task(tg.send(
+                    "⚠️ <b>SAFETY GATE</b>\n\n"
+                    "พยายามเปิด spec_v1 บนบัญชีที่ไม่ใช่ PRACTICE — ระบบบังคับกลับไป legacy อัตโนมัติ"
+                ))
+            except RuntimeError:
+                pass  # no running event loop (e.g. called before asyncio.run) — log above still fired
+        return True
+    return False
 
 
 def load_runtime_config() -> dict:
@@ -124,11 +171,16 @@ def save_runtime_config(cfg: TradingConfig):
         json.dump({k: getattr(cfg, k) for k in RUNTIME_FIELDS}, f, indent=2)
 
 
-def apply_runtime_config(cfg: TradingConfig, rt: dict):
+def apply_runtime_config(cfg: TradingConfig, rt: dict, tg: "TelegramBot | None" = None,
+                          trade_logger: "TradeLogger | None" = None):
     """Apply persisted/dashboard settings onto cfg, coercing to the field's type.
     Martingale OFF (default): max_consecutive_losses is left as-is so the configured
     cooldown fires independently of the (disabled) martingale ladder. A final safety-bounds
-    clamp always runs at the end regardless of martingale on/off (see SAFETY_BOUNDS)."""
+    clamp always runs at the end regardless of martingale on/off (see SAFETY_BOUNDS).
+    tg/trade_logger are optional — passed through so the spec_v1 PRACTICE-only safety gate
+    (§2, call site 1/3) can alert + audit-log a forced fallback. At the very first startup
+    call (main(), before TelegramBot/TradeLogger exist) both are None — the gate still forces
+    the fallback and logs a warning, it just can't alert/audit-log that one instant."""
     for k in RUNTIME_FIELDS:
         if k not in rt:
             continue
@@ -162,6 +214,9 @@ def apply_runtime_config(cfg: TradingConfig, rt: dict):
     # Final safety net — clamp regardless of martingale on/off, and regardless of which
     # call site (startup or dashboard update_settings) invoked this function.
     _clamp_safety_bounds(cfg)
+    # spec_v1 PRACTICE-only hard safety gate (§2, call site 1/3) — runs on every apply,
+    # covering both the startup load and every dashboard update_settings edit.
+    _enforce_spec_v1_practice_gate(cfg, tg, trade_logger)
 
 
 # ─────────────────────────────────────────────────
@@ -188,6 +243,19 @@ class FullTradingBot(TradingBot):
             auto_stop_enabled=cfg.auto_stop_enabled,
             auto_stop_drawdown_pct=cfg.auto_stop_drawdown_pct,
         ))
+
+        # ── spec_v1 live-wiring (San's Architecture Notes §3/§4/§6/§7/§8) ──
+        # self._risk_v2 above is now the SAME RiskManager instance handed to BotStateMachine
+        # (§3) — no second instance is ever created, so counters (open_positions/trades_today/
+        # consecutive_losses) can never diverge from what the risk_v2 dashboard panel shows.
+        self._risk_v2.on_event = self._spec_v1_on_event   # §7 KILL/AUTO_STOP wiring
+        self._trade_logger = TradeLogger()                 # §6 SQLite system-of-record
+        self._candle_stores: dict[str, CandleStore] = {}    # §4.1 one CandleStore per resolved asset
+        self._trend_filter_v1 = TrendFilter()
+        self._entry_signal_v1 = EntrySignal()
+        self._time_filter_v1 = TimeFilter()
+        self._state_machine_v1: BotStateMachine | None = None
+        self._spec_v1_was_active = False   # edge-trigger flag for _sync_state_machine_v1 (§8)
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -262,17 +330,242 @@ class FullTradingBot(TradingBot):
         return self._risk_v2.to_state_dict(balance=state_store.get("balance"))
 
     def build_state_machine_v2(self) -> dict:
-        """§13.1 `state_machine` + `global_state`. spec_v1 isn't driving live orders yet
-        (strategy_mode default = "legacy") so every asset reports IDLE with an explanatory
-        reason rather than a fabricated in-progress state."""
+        """§13.1 `state_machine` + `global_state`. When strategy_mode=="spec_v1" and a
+        BotStateMachine instance is actually driving live orders, source the real per-asset
+        state/global_state from it (§9 — same WS contract shape Pixel already built against,
+        just backed by real data now). Otherwise fall back to the original fabricated-IDLE
+        text so the dashboard still reads sensibly while spec_v1 is off."""
+        if self.cfg.strategy_mode == "spec_v1" and self._state_machine_v1 is not None:
+            return self._state_machine_v1.to_state_dict()
         assets = self.cfg.enabled_pairs or [self.cfg.default_pair]
-        reason = ("spec_v1 modules built + unit-tested, not yet driving live orders — "
-                   "awaiting a passing out-of-sample backtest (spec §10) before cutover")
+        reason = ("spec_v1 modules built + unit-tested, not driving live orders right now — "
+                   "either strategy_mode is 'legacy', or awaiting the safety gate/backtest gate")
         return {
             "state_machine": {a: {"state": "IDLE", "since": datetime.now().isoformat(), "reason": reason}
                                for a in assets},
             "global_state": "RUNNING",
         }
+
+    # ── spec_v1 live-wiring helpers (San's Architecture Notes §3-§8) ──
+    def _spec_v1_on_event(self, event_type: str, detail: dict):
+        """Single sink for both RiskManager.on_event and BotStateMachine.on_event (§7).
+        Every event is audit-logged to SQLite system_events; KILL/AUTO_STOP additionally
+        fire a Telegram alert so a rollback-triggering event is never silent."""
+        ts = datetime.now(ZoneInfo("Asia/Bangkok")).isoformat()
+        try:
+            self._trade_logger.write_system_event(ts, event_type, detail)
+        except Exception as e:
+            logger.warning(f"[SPEC_V1] write_system_event failed: {e}")
+        if event_type == "KILL":
+            asyncio.create_task(self.tg.send(
+                "🛑 <b>spec_v1 KILLED</b>\n\n"
+                f"เหตุผล: {_h(detail.get('reason'))}\n"
+                "spec_v1 หยุดเปิดออเดอร์ใหม่ทั้งหมดแล้ว (demo) — ต้องสลับ strategy_mode หรือรีสตาร์ทเอง "
+                "จาก dashboard/Telegram ก่อนจะกลับมาเทรดต่อ"
+            ))
+        elif event_type == "AUTO_STOP_TRIGGERED":
+            asyncio.create_task(self.tg.send(
+                "⚠️ <b>spec_v1 AUTO-STOP triggered</b>\n\n"
+                f"equity ลดเกิน threshold ({detail.get('drawdown_pct')}%) — ต้องกด reset baseline จาก dashboard"
+            ))
+
+    def _ensure_candle_stores(self):
+        """§4.1 — one CandleStore per resolved real-forex asset (self.cfg.assets, NOT the
+        raw enabled_pairs list). Bootstraps (200 closed candles, once) only for assets that
+        don't already have a store — an asset that temporarily disappears and comes back
+        keeps its history instead of re-bootstrapping from scratch."""
+        for asset in (self.cfg.assets or []):
+            if asset in self._candle_stores:
+                continue
+            store = CandleStore(asset)
+            try:
+                store.bootstrap(self.iq)
+            except Exception as e:
+                logger.warning(f"[SPEC_V1] bootstrap candle store failed for {asset}: {e}")
+            self._candle_stores[asset] = store
+
+    async def _spec_v1_append_new_candle(self, asset: str, tf: str):
+        """§4.2 — fetch only the last 2 candles (never re-fetch 200/cycle), normalize (drops
+        the still-forming candle — candle_store.py's single no-repaint choke point), then
+        append the newest CLOSED candle if it's genuinely new (dedup guard in append_if_new)."""
+        store = self._candle_stores.get(asset)
+        if not store:
+            return
+        seconds = 900 if tf == "m15" else 300
+        try:
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(self.iq.get_candles, asset, seconds, 2, time.time()), timeout=15)
+        except Exception as e:
+            logger.warning(f"[SPEC_V1] get_candles({asset}, {tf}) failed: {e}")
+            return
+        candles = CandleStore._normalize_iq_candles(raw or [], drop_forming=True)
+        if not candles:
+            return
+        store.append_if_new(tf, candles[-1])
+
+    def _spec_v1_place_order(self, asset: str, direction: str, stake: float):
+        """§4.3 — thin wrapper around TradeManager._place_order() (no new broker-call code).
+        source="spec_v1" (NOT "auto") so legacy's _auto_locked_until expiry-hard-lock and
+        _apply_close()'s auto-only consecutive-loss counter are never touched by spec_v1 —
+        RiskManager.can_trade()'s own no-overlap gate (_open_positions>0) is spec_v1's
+        equivalent, already wired via the shared self._risk_v2 instance (§3).
+        Snapshots the M5/M15 indicator values used for THIS entry (independently, from the
+        same CandleStore the state machine just evaluated — no state_machine.py contract
+        change needed) so §6's SQLite schema (ema20_m15/ema50_m15/ema20_m5/rsi_m5/atr_m5)
+        is populated without re-deriving state_machine's internal decision path."""
+        meta = {"source": "spec_v1", "confidence": None, "balance_before": state_store.get("balance")}
+        trend = self._state_machine_v1.trend_states.get(asset) if self._state_machine_v1 else None
+        if trend is not None:
+            meta["ema20_m15"] = trend.ema20
+            meta["ema50_m15"] = trend.ema50
+        try:
+            store = self._candle_stores.get(asset)
+            if store is not None:
+                df5 = IndicatorEngineV2.compute_m5(store.m5_df())
+                last = df5.iloc[-1]
+                meta["ema20_m5"] = None if pd.isna(last.ema20) else float(last.ema20)
+                meta["rsi_m5"] = None if pd.isna(last.rsi14) else float(last.rsi14)
+                meta["atr_m5"] = None if pd.isna(last.atr14) else float(last.atr14)
+        except Exception as e:
+            logger.warning(f"[SPEC_V1] failed to snapshot M5 indicators for {asset}: {e}")
+        return self.trade_manager._place_order(asset, direction, stake, meta)
+
+    def _spec_v1_log_trade_to_sqlite(self, t: dict):
+        """§6 — the SQLite system-of-record write (trades.json already gets this trade for
+        free via _place_order()). One row per trade, written once at close time when the
+        full entry+exit picture is known."""
+        try:
+            self._trade_logger.write_trade({
+                "order_id": t.get("id"),
+                "timestamp": t.get("open_time"),
+                "pair": t.get("asset"),
+                "direction": t.get("direction"),
+                "stake": t.get("amount"),
+                "entry_price": t.get("entry"),
+                "expiry_price": None,
+                "result": t.get("result"),
+                "pnl": t.get("pnl"),
+                "ema20_m15": t.get("ema20_m15"),
+                "ema50_m15": t.get("ema50_m15"),
+                "ema20_m5": t.get("ema20_m5"),
+                "rsi_m5": t.get("rsi_m5"),
+                "atr_m5": t.get("atr_m5"),
+                "pattern_type": t.get("pattern_type"),
+                "trend_status": t.get("trend_status"),
+                "latency_ms": t.get("latency_ms"),
+                "balance_before": t.get("balance_before"),
+                "balance_after": state_store.get("balance"),
+                "source": t.get("source"),
+                "martingale_step": None,   # spec_v1 does not use Martingale (§4.3)
+                "state_trace": None,
+            })
+        except Exception as e:
+            logger.warning(f"[SPEC_V1] write_trade to SQLite failed: {e}")
+
+    def _sync_state_machine_v1(self):
+        """§8 rollback wiring — (Re)creates a fresh BotStateMachine exactly when
+        strategy_mode transitions INTO "spec_v1" from something else, never mid-run. This is
+        what makes strategy_mode's existing live RUNTIME_FIELDS switch a real, no-restart
+        rollback: switching legacy -> spec_v1 -> legacy -> spec_v1 always starts the new
+        spec_v1 run with error_streak=0 / global_state=RUNNING, never a stale KILLED state
+        carried over from a previous activation."""
+        want_active = (self.cfg.strategy_mode == "spec_v1")
+        if want_active and not self._spec_v1_was_active:
+            self._state_machine_v1 = BotStateMachine(
+                assets=self.cfg.assets or [], candle_stores=self._candle_stores,
+                trend_filter=self._trend_filter_v1, entry_signal=self._entry_signal_v1,
+                time_filter=self._time_filter_v1, risk_manager=self._risk_v2,
+                place_order_fn=self._spec_v1_place_order,
+                get_balance_fn=lambda: state_store.get("balance"),
+                martingale=None,  # opt-in, not spec_v1's default (§4.3) — separate ticket
+                on_event=self._spec_v1_on_event,
+            )
+            logger.info("[SPEC_V1] BotStateMachine (re)created — fresh state, error_streak=0")
+        self._spec_v1_was_active = want_active
+
+    async def spec_v1_m5_loop(self):
+        """§4.2 M5 close scheduler — independent of legacy's main_loop(). Always running
+        (checks strategy_mode/gate every tick, never gated at process-start) so switching
+        spec_v1 <-> legacy is live, no restart (§8)."""
+        while True:
+            now = time.time()
+            wait = 300 - (now % 300) + 8
+            await asyncio.sleep(wait)
+            if self.cfg.strategy_mode != "spec_v1":
+                continue
+            if _enforce_spec_v1_practice_gate(self.cfg, self.tg, self._trade_logger):  # §2 site 3/3
+                continue
+            self._sync_state_machine_v1()
+            if not self._state_machine_v1 or not self.cfg.assets:
+                continue
+            for asset in self.cfg.assets:
+                await self._spec_v1_append_new_candle(asset, "m5")
+                # §2 site 3/3 (bug-155 fix): the `await` above is a real asyncio interleave
+                # point — a concurrent switch_account/apply_runtime_config call can flip
+                # strategy_mode/account_type *during* this await. Recheck BEFORE EVERY asset's
+                # broker-facing on_m5_close() call, not just once per tick. Two conditions must
+                # both be re-verified, not just the gate call's return value: (a) the gate may
+                # trip right now (still spec_v1, but account flipped to non-PRACTICE), OR (b) a
+                # PRIOR interleaved call (e.g. from switch_account's own handler) may have already
+                # tripped the gate and self-healed strategy_mode to "legacy" — in that case calling
+                # the gate again returns False (its condition requires strategy_mode=="spec_v1"),
+                # so strategy_mode must be rechecked independently or this second case is missed.
+                # If it trips mid-loop, abandon the REST of this tick's assets too — a tripped gate
+                # means the whole system must fall back to legacy right now, not skip-and-continue
+                # per asset.
+                if (self.cfg.strategy_mode != "spec_v1"
+                        or _enforce_spec_v1_practice_gate(self.cfg, self.tg, self._trade_logger)):
+                    logger.warning(
+                        f"[SPEC_V1] safety gate/mode check failed mid-tick before "
+                        f"on_m5_close({asset}) — aborting remaining assets in this tick."
+                    )
+                    break
+                try:
+                    self._state_machine_v1.on_m5_close(asset)
+                except Exception as e:
+                    logger.error(f"[SPEC_V1] on_m5_close({asset}) error: {e}", exc_info=True)
+                    self._state_machine_v1.record_process_error(str(e))
+            state_store["risk_v2"] = self.build_risk_v2()
+            state_store.update(self.build_state_machine_v2())
+            await broadcast({"type": "update", "data": {
+                "risk_v2": state_store.get("risk_v2"),
+                "state_machine": state_store.get("state_machine"),
+                "global_state": state_store.get("global_state"),
+            }})
+
+    async def spec_v1_m15_loop(self):
+        """§4.2 M15 trend-refresh scheduler — lighter than the M5 loop, only updates
+        TrendState per asset (does not place orders directly)."""
+        while True:
+            now = time.time()
+            wait = 900 - (now % 900) + 8
+            await asyncio.sleep(wait)
+            if self.cfg.strategy_mode != "spec_v1":
+                continue
+            if _enforce_spec_v1_practice_gate(self.cfg, self.tg, self._trade_logger):  # §2 site 3/3
+                continue
+            self._sync_state_machine_v1()
+            if not self._state_machine_v1 or not self.cfg.assets:
+                continue
+            for asset in self.cfg.assets:
+                await self._spec_v1_append_new_candle(asset, "m15")
+                # §2 site 3/3 (bug-155 fix): same interleave hazard as spec_v1_m5_loop — recheck
+                # BOTH strategy_mode and the gate's own return value before every asset's
+                # on_m15_close() (a prior interleaved trip self-heals strategy_mode to "legacy",
+                # which makes a second gate call alone return False — see spec_v1_m5_loop's
+                # comment for the full reasoning), and abort the rest of the tick's assets (not
+                # just this one) if either check fails.
+                if (self.cfg.strategy_mode != "spec_v1"
+                        or _enforce_spec_v1_practice_gate(self.cfg, self.tg, self._trade_logger)):
+                    logger.warning(
+                        f"[SPEC_V1] safety gate/mode check failed mid-tick before on_m15_close({asset}) "
+                        "— aborting remaining assets in this tick."
+                    )
+                    break
+                try:
+                    self._state_machine_v1.on_m15_close(asset)
+                except Exception as e:
+                    logger.error(f"[SPEC_V1] on_m15_close({asset}) error: {e}", exc_info=True)
 
     def build_martingale_warning(self) -> str | None:
         if self.cfg.martingale_enabled and self.cfg.martingale_ack_risk:
@@ -338,6 +631,7 @@ class FullTradingBot(TradingBot):
             try:
                 await asyncio.wait_for(asyncio.to_thread(self.resolve_assets), timeout=60)
                 self._need_resolve = False
+                self._ensure_candle_stores()  # §4.1 — keep spec_v1's per-asset stores in sync
             except Exception as e:
                 logger.warning(f"[ASSET] resolve failed: {e}")
 
@@ -416,48 +710,60 @@ class FullTradingBot(TradingBot):
         # slots_free is re-read from active_orders live each iteration — never a stale counter.
         candidates.sort(key=lambda s: s.confidence, reverse=True)
         placed = None
-        in_cooldown = time.time() < self._cooldown_until
-        if in_cooldown:
-            remain = int((self._cooldown_until - time.time()) / 60) + 1
-            self.log_activity("⏳", f"พักหลังแพ้ติดกัน — เหลืออีก ~{remain} นาที จึงกลับมาเปิดออเดอร์", phase="cooldown")
         unavailable_this_cycle: list[str] = []
-        for signal in candidates:
+        # §1 — strategy_mode switch is REPLACE, not parallel: when spec_v1 is active, legacy
+        # stops opening auto orders entirely (spec_v1's own M5/M15 scheduler is the only auto
+        # order path — see spec_v1_m5_loop). Legacy signals above are still computed/shown on
+        # the dashboard (read-only) so the two engines can be compared side by side.
+        if self.cfg.strategy_mode != "spec_v1":
+            in_cooldown = time.time() < self._cooldown_until
             if in_cooldown:
+                remain = int((self._cooldown_until - time.time()) / 60) + 1
+                self.log_activity("⏳", f"พักหลังแพ้ติดกัน — เหลืออีก ~{remain} นาที จึงกลับมาเปิดออเดอร์", phase="cooldown")
+            for signal in candidates:
+                if in_cooldown:
+                    break
+                # Re-query active_orders and expiry lock live — covers trades placed moments ago
+                # or closed by external_sync_loop between iterations.
+                if len(self.trade_manager.active_orders) >= self.cfg.max_open_positions:
+                    break
+                if time.time() < self.trade_manager._auto_locked_until:
+                    break
+                async with self._iq_lock:
+                    trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
+                if trade is _ORDER_UNAVAILABLE:
+                    # Broker says pair unavailable right now — try next highest-confidence signal
+                    logger.info(f"[CYCLE] {signal.asset} unavailable — trying next signal this cycle")
+                    unavailable_this_cycle.append(signal.asset)
+                    continue
+                if isinstance(trade, dict):
+                    placed = trade
+                    state_store["trades"] = self.trade_manager.trades
+                    await broadcast({"type": "new_trade", "data": trade})
+                    asyncio.create_task(self.tg.alert_trade_open(trade))
+                    mg = f" · ไม้ {trade.get('mg_step')}" if trade.get("mg_step") else ""
+                    self.log_activity("🚀", f"เปิดออเดอร์ {trade['asset']} {trade['direction']} ที่ {(trade.get('confidence') or 0):.0f}%{mg}", phase="trading")
+                    # spec_v1 §13.1 counters — parallel bookkeeping only, does not gate the live order
+                    try:
+                        self._risk_v2.record_order_placed()
+                    except Exception as e:
+                        logger.warning(f"[RISK-V2] record_order_placed (auto) failed: {e}")
+                # trade is None (risk block / veto / other order error) or a placed trade —
+                # either way, stop trying further signals this cycle.
                 break
-            # Re-query active_orders and expiry lock live — covers trades placed moments ago
-            # or closed by external_sync_loop between iterations.
-            if len(self.trade_manager.active_orders) >= self.cfg.max_open_positions:
-                break
-            if time.time() < self.trade_manager._auto_locked_until:
-                break
-            async with self._iq_lock:
-                trade = await asyncio.to_thread(self.trade_manager.execute_trade, signal)
-            if trade is _ORDER_UNAVAILABLE:
-                # Broker says pair unavailable right now — try next highest-confidence signal
-                logger.info(f"[CYCLE] {signal.asset} unavailable — trying next signal this cycle")
-                unavailable_this_cycle.append(signal.asset)
-                continue
-            if isinstance(trade, dict):
-                placed = trade
-                state_store["trades"] = self.trade_manager.trades
-                await broadcast({"type": "new_trade", "data": trade})
-                asyncio.create_task(self.tg.alert_trade_open(trade))
-                mg = f" · ไม้ {trade.get('mg_step')}" if trade.get("mg_step") else ""
-                self.log_activity("🚀", f"เปิดออเดอร์ {trade['asset']} {trade['direction']} ที่ {(trade.get('confidence') or 0):.0f}%{mg}", phase="trading")
-                # spec_v1 §13.1 counters — parallel bookkeeping only, does not gate the live order
-                try:
-                    self._risk_v2.record_order_placed()
-                except Exception as e:
-                    logger.warning(f"[RISK-V2] record_order_placed (auto) failed: {e}")
-            # trade is None (risk block / veto / other order error) or a placed trade —
-            # either way, stop trying further signals this cycle.
-            break
 
         # Summarize the decision so the dashboard shows what the bot is doing / waiting for
         best = max(signals_this_cycle, key=lambda s: s.get("confidence") or 0, default=None)
         best_txt = f"{best['asset']} {best['signal']} {(best.get('confidence') or 0):.0f}%" if best else "-"
         if not got_data:
             self.log_activity("⚠️", "ดึงแท่งเทียนไม่ได้สักคู่ — ตลาดอาจปิดหรือการเชื่อมต่อ IQ มีปัญหา", level="warn", phase="error")
+        elif self.cfg.strategy_mode == "spec_v1":
+            # §1 — legacy is intentionally not opening orders in this mode; make that explicit
+            # instead of showing the generic "blocked" message legacy would show when idle.
+            if candidates:
+                self.log_activity("🧪", f"โหมด spec_v1 ทำงานอยู่ — legacy ไม่เปิดออเดอร์ (มี {len(candidates)} สัญญาณ legacy ไว้เทียบผลเท่านั้น)", phase="spec_v1_compare")
+            else:
+                self.log_activity("🧪", "โหมด spec_v1 ทำงานอยู่ — legacy หยุดเปิดออเดอร์อัตโนมัติทั้งหมด", phase="spec_v1_compare")
         elif placed is None and candidates:
             if len(self.trade_manager.active_orders) >= self.cfg.max_open_positions:
                 reason = f"รอปิดไม้ที่เปิดอยู่ก่อน ({len(self.trade_manager.active_orders)} open)"
@@ -592,6 +898,12 @@ class FullTradingBot(TradingBot):
         elif cmd == "switch_account":
             account = kwargs.get("account", "PRACTICE")
             self.cfg.account_type = account
+            # §2 site 2/3 — switch_account previously had NO safety-gate check at all (San's
+            # gap finding): switching to REAL while strategy_mode=="spec_v1" must force spec_v1
+            # back to legacy immediately, not just at the next config apply.
+            if _enforce_spec_v1_practice_gate(self.cfg, self.tg, self._trade_logger):
+                save_runtime_config(self.cfg)
+                await self._push_settings()
             try:
                 self.iq.change_balance(account)
                 state_store["account_type"] = account
@@ -629,7 +941,7 @@ class FullTradingBot(TradingBot):
                 settings["martingale_max_steps"] = max(1, min(8, int(settings["martingale_max_steps"])))
             if "max_open_positions" in settings:
                 settings["max_open_positions"] = 1  # always 1: global single Martingale ladder
-            apply_runtime_config(self.cfg, settings)
+            apply_runtime_config(self.cfg, settings, self.tg, self._trade_logger)
             save_runtime_config(self.cfg)
             logger.info(f"[CMD] Settings updated: {', '.join(settings.keys())}")
             await self._push_settings()
@@ -935,13 +1247,27 @@ class FullTradingBot(TradingBot):
                     self.log_activity(icon, f"ปิดไม้ {t['asset']} {t['direction']} → {t['result']} ({pnl:+.2f})",
                                       level="error" if t["result"] == "LOSS" else "info", phase="result")
                     asyncio.create_task(self.tg.alert_result(t, today_stats))
-                    # spec_v1 §13.1 counters — parallel bookkeeping only, does not gate the live
-                    # order. count_streak mirrors legacy's own consecutive_losses field, which
-                    # trading_engine._apply_close() only increments for source == "auto".
-                    try:
-                        self._risk_v2.record_order_result(pnl, t["result"], count_streak=(t.get("source") == "auto"))
-                    except Exception as e:
-                        logger.warning(f"[RISK-V2] record_order_result failed: {e}")
+                    # §5 — MUST branch exclusively on source=="spec_v1" here: BotStateMachine.
+                    # on_trade_closed() already calls self.risk_manager.record_order_result()
+                    # internally (state_machine.py, count_streak defaults True) using the SAME
+                    # self._risk_v2 instance. Calling self._risk_v2.record_order_result() again
+                    # in the else-branch for a spec_v1 trade would double-count P&L/streak —
+                    # this if/else (never both) is the guard against that.
+                    if t.get("source") == "spec_v1":
+                        if self._state_machine_v1 is not None:
+                            try:
+                                self._state_machine_v1.on_trade_closed(t["asset"], pnl, t["result"])
+                            except Exception as e:
+                                logger.warning(f"[SPEC_V1] on_trade_closed failed: {e}")
+                        self._spec_v1_log_trade_to_sqlite(t)
+                    else:
+                        # spec_v1 §13.1 counters — parallel bookkeeping only, does not gate the
+                        # live order. count_streak mirrors legacy's own consecutive_losses field,
+                        # which trading_engine._apply_close() only increments for source=="auto".
+                        try:
+                            self._risk_v2.record_order_result(pnl, t["result"], count_streak=(t.get("source") == "auto"))
+                        except Exception as e:
+                            logger.warning(f"[RISK-V2] record_order_result failed: {e}")
                 # Force-expired (unresolved, slot freed): notify so the user isn't left guessing
                 elif t.get("status") == "expired":
                     self.log_activity("⏰", f"ออเดอร์ค้าง {t['asset']} {t['direction']} — เคลียร์ช่องแล้ว",
@@ -987,6 +1313,7 @@ class FullTradingBot(TradingBot):
         # (otherwise the alert shows the 5 default majors while the dashboard shows 0).
         try:
             await asyncio.wait_for(asyncio.to_thread(self.resolve_assets), timeout=60)
+            self._ensure_candle_stores()  # §4.1
         except Exception as e:
             logger.warning(f"[ASSET] initial resolve failed: {e}")
 
@@ -1129,17 +1456,19 @@ async def main():
         daily_loss_limit=float(os.getenv("IQ_DAILY_LOSS_LIMIT", "150.0")),  # match config default so a missing config.json never silently disables the loss limit
     )
 
-    # Dashboard-saved settings override env
-    apply_runtime_config(cfg, load_runtime_config())
-
     tg_cfg = TelegramConfig(
         bot_token=os.getenv("TG_TOKEN", ""),
         chat_id=os.getenv("TG_CHAT_ID", ""),
         min_confidence=80.0,
         enabled=bool(os.getenv("TG_TOKEN")),
     )
-
     tg = TelegramBot(tg_cfg)
+
+    # Dashboard-saved settings override env. tg is constructed first (above) so the spec_v1
+    # PRACTICE-only safety gate (§2 site 1/3, inside apply_runtime_config) can alert on a
+    # forced fallback even at cold-start, not just from later dashboard edits.
+    apply_runtime_config(cfg, load_runtime_config(), tg)
+
     bot = FullTradingBot(cfg, tg)
     _bot_ref = bot
 
@@ -1148,6 +1477,8 @@ async def main():
         bot.main_loop(),
         bot.external_sync_loop(),
         bot.telegram_command_loop(),
+        bot.spec_v1_m5_loop(),
+        bot.spec_v1_m15_loop(),
     )
 
 

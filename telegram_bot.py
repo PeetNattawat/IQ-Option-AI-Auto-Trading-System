@@ -79,7 +79,11 @@ class TelegramBot:
 
     @staticmethod
     def _src_label(source: str) -> str:
-        return "🤖 Bot" if source == "auto" else "✋ Manual"
+        if source == "auto":
+            return "🤖 Bot"
+        if source == "spec_v1":
+            return "🧪 spec_v1"
+        return "✋ Manual"
 
     @staticmethod
     def _pretty_asset(asset) -> str:
@@ -184,8 +188,10 @@ class TelegramBot:
 
         asset_name = _h(self._pretty_asset(trade.get('asset')))
         expiry = _h(trade.get('expiry', '?'))
+        tag_line = "🧪 <b>spec_v1 (demo)</b>\n" if trade.get("source") == "spec_v1" else ""
         text = (
             f"🚀 <b>ออกออเดอร์ {self._dir_label(direction)}</b>\n"
+            f"{tag_line}"
             f"\n"
             f"📌 คู่เงิน: <b>{asset_name}</b>\n"
             f"💵 ลงทุน: <b>฿{trade.get('amount', 0):.0f}</b>\n"
@@ -228,8 +234,10 @@ class TelegramBot:
             summary_line = ""
 
         asset_name = _h(self._pretty_asset(trade.get('asset')))
+        tag_line = "🧪 <b>spec_v1 (demo)</b>\n" if trade.get("source") == "spec_v1" else ""
         text = (
             f"{head}\n"
+            f"{tag_line}"
             f"\n"
             f"📌 <b>{asset_name}</b> · {self._dir_label(trade.get('direction', '?'))}\n"
             f"👤 ที่มา: {self._src_label(trade.get('source', 'auto'))}\n"
