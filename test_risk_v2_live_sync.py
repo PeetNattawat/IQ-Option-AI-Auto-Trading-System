@@ -27,6 +27,7 @@ No network access required.
 import os
 import sys
 from datetime import datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 try:
@@ -172,6 +173,89 @@ def test_main_py_wires_the_hooks():
           result_calls >= 1, f"found {result_calls}")
     check("live-sync: record_order_result call passes count_streak keyed off trade source",
           'count_streak=(t.get("source") == "auto")' in src)
+
+
+# ─────────────────────────────────────────
+# 5. bug-16x — max_trades_per_day / max_consecutive_losses were missing from the field list
+#    that main.py's __init__ used to build self._risk_v2's RiskConfig, so RiskConfig's
+#    hardcoded dataclass defaults (5 / 3) silently governed spec_v1 forever regardless of
+#    what config.json's max_trades_per_day/max_consecutive_losses said. Fixed via a single
+#    RISK_V2_SYNC_FIELDS tuple used both at construction and at re-sync time.
+# ─────────────────────────────────────────
+import main  # noqa: E402  (import after os.chdir so main.py's relative data/ paths resolve)
+from trading_engine import TradingConfig
+
+
+def test_risk_v2_sync_fields_include_the_two_previously_missing_fields():
+    check("bug-16x: RISK_V2_SYNC_FIELDS includes max_trades_per_day",
+          "max_trades_per_day" in main.RISK_V2_SYNC_FIELDS, main.RISK_V2_SYNC_FIELDS)
+    check("bug-16x: RISK_V2_SYNC_FIELDS includes max_consecutive_losses",
+          "max_consecutive_losses" in main.RISK_V2_SYNC_FIELDS, main.RISK_V2_SYNC_FIELDS)
+
+
+def test_construction_honors_custom_max_trades_per_day_not_the_riskconfig_default():
+    """Reproduces Peet's exact production report: cfg.max_trades_per_day=50 in config.json
+    must reach risk_v2, not silently stay at RiskConfig's dataclass default of 5."""
+    cfg = TradingConfig(max_trades_per_day=50, max_consecutive_losses=9)
+    risk_cfg = RiskConfig(**{f: getattr(cfg, f) for f in main.RISK_V2_SYNC_FIELDS})
+    check("bug-16x: constructed RiskConfig.max_trades_per_day reflects cfg (50), not the default (5)",
+          risk_cfg.max_trades_per_day == 50, risk_cfg)
+    check("bug-16x: constructed RiskConfig.max_consecutive_losses reflects cfg (9), not the default (3)",
+          risk_cfg.max_consecutive_losses == 9, risk_cfg)
+
+
+def test_construction_effective_gate_uses_the_custom_value():
+    """Functional proof, not just a field-equality check: can_trade() must actually allow
+    a 10th trade when max_trades_per_day=50 (would have been hard-blocked at 5 pre-fix)."""
+    cfg = TradingConfig(max_trades_per_day=50, max_consecutive_losses=9)
+    rm = _fresh_risk_manager("construction_gate", **{f: getattr(cfg, f) for f in main.RISK_V2_SYNC_FIELDS})
+    now = datetime(2026, 7, 13, 10, 0, tzinfo=BANGKOK)
+    rm.roll_boundaries(now, 1000)
+    for _ in range(10):
+        rm.record_order_placed()
+        rm.record_order_result(1.0, "WIN", now, count_streak=True)
+    ok, reason = rm.can_trade(now, balance=1010)
+    check("bug-16x: 10 trades done, max=50 -> can_trade() still allows more (pre-fix would block at 5)",
+          ok, reason)
+
+
+def test_apply_runtime_config_reload_syncs_into_risk_v2():
+    """Reproduces the 2nd half of Peet's report: editing config.json + restart/reload must
+    reach the ALREADY-CONSTRUCTED self._risk_v2.cfg too, not just a fresh instance.
+    Exercises FullTradingBot._sync_risk_v2_config as an unbound method against a duck-typed
+    stand-in (same technique test_spec_v1_live_wiring.py already uses for
+    _sync_state_machine_v1) — avoids constructing a real FullTradingBot / IQ connection."""
+    fake = SimpleNamespace(
+        cfg=TradingConfig(),  # defaults: max_trades_per_day=20, max_consecutive_losses=4
+        _risk_v2=RiskManager(RiskConfig()),  # RiskConfig defaults: 5 / 3 — deliberately stale
+    )
+    before = fake._risk_v2.cfg
+    check("bug-16x: sanity — risk_v2 starts on RiskConfig's stale hardcoded defaults",
+          before.max_trades_per_day == 5 and before.max_consecutive_losses == 3, before)
+
+    # Simulate what apply_runtime_config() does on a config.json reload / dashboard edit:
+    fake.cfg.max_trades_per_day = 50
+    fake.cfg.max_consecutive_losses = 9
+    main.FullTradingBot._sync_risk_v2_config(fake)
+
+    after = fake._risk_v2.cfg
+    check("bug-16x: after re-sync, risk_v2.cfg.max_trades_per_day reflects the reloaded value (50)",
+          after.max_trades_per_day == 50, after)
+    check("bug-16x: after re-sync, risk_v2.cfg.max_consecutive_losses reflects the reloaded value (9)",
+          after.max_consecutive_losses == 9, after)
+
+
+def test_main_py_calls_sync_after_update_settings_apply_runtime_config():
+    """Static guard — confirms the dashboard update_settings call site actually re-syncs
+    risk_v2 right after apply_runtime_config(), so this can't silently regress later."""
+    with open("main.py", encoding="utf-8") as f:
+        src = f.read()
+    idx = src.index('elif cmd == "update_settings"')
+    snippet = src[idx: idx + 1200]
+    check("bug-16x: update_settings handler calls apply_runtime_config(self.cfg, settings, ...)",
+          "apply_runtime_config(self.cfg, settings" in snippet)
+    check("bug-16x: update_settings handler calls self._sync_risk_v2_config() right after",
+          "self._sync_risk_v2_config()" in snippet)
 
 
 if __name__ == "__main__":

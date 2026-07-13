@@ -40,6 +40,23 @@ from telegram_bot import TelegramBot, TelegramConfig
 from risk_manager import RiskConfig, RiskManager
 from martingale import MartingaleModule, WARNING_TEXT as MARTINGALE_WARNING_TEXT
 
+# Single source of truth for every TradingConfig field that must stay mirrored onto the
+# spec_v1 RiskManager's RiskConfig (self._risk_v2.cfg). Used both at construction time
+# (FullTradingBot.__init__) and for re-sync after every later apply_runtime_config() call
+# (see FullTradingBot._sync_risk_v2_config). bug-16x: max_trades_per_day and
+# max_consecutive_losses were missing from this list entirely, so RiskConfig's hardcoded
+# dataclass defaults (5 / 3) silently governed spec_v1 regardless of what config.json said.
+RISK_V2_SYNC_FIELDS = (
+    "stake_pct",
+    "max_trades_per_day",
+    "max_consecutive_losses",
+    "daily_loss_limit_pct",
+    "weekly_loss_limit_pct",
+    "signal_cooldown_minutes",
+    "auto_stop_enabled",
+    "auto_stop_drawdown_pct",
+)
+
 # ── spec_v1 live-wiring (San's Architecture Notes, outputs/10_san-iqoption-spec-v1-live-wiring.md) ──
 from candle_store import CandleStore
 from entry_signal import EntrySignal
@@ -242,11 +259,7 @@ class FullTradingBot(TradingBot):
         # Pixel/Iris can build/test against the real shape now. Does NOT gate the live
         # legacy trading path (see build_risk_v2 docstring / strategy_mode rationale).
         self._risk_v2 = RiskManager(RiskConfig(
-            stake_pct=cfg.stake_pct, daily_loss_limit_pct=cfg.daily_loss_limit_pct,
-            weekly_loss_limit_pct=cfg.weekly_loss_limit_pct,
-            signal_cooldown_minutes=cfg.signal_cooldown_minutes,
-            auto_stop_enabled=cfg.auto_stop_enabled,
-            auto_stop_drawdown_pct=cfg.auto_stop_drawdown_pct,
+            **{f: getattr(cfg, f) for f in RISK_V2_SYNC_FIELDS}
         ))
 
         # ── spec_v1 live-wiring (San's Architecture Notes §3/§4/§6/§7/§8) ──
@@ -261,6 +274,17 @@ class FullTradingBot(TradingBot):
         self._time_filter_v1 = TimeFilter()
         self._state_machine_v1: BotStateMachine | None = None
         self._spec_v1_was_active = False   # edge-trigger flag for _sync_state_machine_v1 (§8)
+
+    def _sync_risk_v2_config(self):
+        """Re-mirror RISK_V2_SYNC_FIELDS from self.cfg onto self._risk_v2.cfg.
+        self._risk_v2.cfg is a SEPARATE RiskConfig object built once in __init__ — apply_runtime_config()
+        only ever mutates self.cfg (the TradingConfig instance), so without this explicit re-sync any
+        later config reload/dashboard edit (update_settings) would silently leave risk_v2 running on
+        stale values (e.g. config.json's max_trades_per_day=50 never reaching spec_v1's can_trade()
+        gate, which kept firing off the RiskConfig dataclass default of 5). Call this immediately after
+        every apply_runtime_config(self.cfg, ...) call that happens post-__init__."""
+        for f in RISK_V2_SYNC_FIELDS:
+            setattr(self._risk_v2.cfg, f, getattr(self.cfg, f))
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -962,6 +986,7 @@ class FullTradingBot(TradingBot):
             if "max_open_positions" in settings:
                 settings["max_open_positions"] = 1  # always 1: global single Martingale ladder
             apply_runtime_config(self.cfg, settings, self.tg, self._trade_logger)
+            self._sync_risk_v2_config()  # bug-16x: keep risk_v2's RiskConfig mirrored after every edit
             save_runtime_config(self.cfg)
             logger.info(f"[CMD] Settings updated: {', '.join(settings.keys())}")
             await self._push_settings()
