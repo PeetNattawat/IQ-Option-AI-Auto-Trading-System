@@ -41,6 +41,14 @@ PINBAR_WICK_BODY_RATIO = 2.0    # dominant wick >= 2x body
 PINBAR_MIN_WICK_ATR_MULT = 0.5  # spec §4.2: dominant wick >= 0.5 x ATR14(M5)
 
 
+def _default_diag() -> dict:
+    """Diagnostic breakdown for [SPEC_V1_SIGNAL] logging (state_machine.py's on_m5_close()).
+    "n/a" = this check was never reached because an earlier gate already short-circuited
+    (all sub-checks are AND'ed hard gates, see module docstring) — never populated with a
+    fake pass/fail so the log line always shows exactly how far evaluation actually got."""
+    return {"pullback": "n/a", "pattern": "n/a", "rsi": "n/a", "vol": "n/a"}
+
+
 @dataclass
 class EntryResult:
     asset: str
@@ -49,13 +57,15 @@ class EntryResult:
     pattern: Optional[str] = None      # "engulfing" | "pinbar" | None
     trend_status: Optional[str] = None
     row: dict = field(default_factory=dict)   # snapshot of indicator values at signal time
+    diag: dict = field(default_factory=_default_diag)  # per-condition breakdown for logging
 
     @classmethod
-    def hold(cls, asset: str, reason: str) -> "EntryResult":
-        return cls(asset=asset, signal="HOLD", reason=reason)
+    def hold(cls, asset: str, reason: str, diag: Optional[dict] = None) -> "EntryResult":
+        return cls(asset=asset, signal="HOLD", reason=reason, diag=diag or _default_diag())
 
     @classmethod
-    def actionable(cls, asset: str, side: str, pattern: str, row: pd.Series, trend: TrendState) -> "EntryResult":
+    def actionable(cls, asset: str, side: str, pattern: str, row: pd.Series, trend: TrendState,
+                    diag: Optional[dict] = None) -> "EntryResult":
         return cls(
             asset=asset, signal=side, reason=f"entry ok ({pattern})", pattern=pattern,
             trend_status=trend.status,
@@ -64,6 +74,7 @@ class EntryResult:
                 "rsi14": float(row["rsi14"]), "atr14": float(row["atr14"]),
                 "ts": row.get("ts"),
             },
+            diag=diag or _default_diag(),
         )
 
 
@@ -113,17 +124,19 @@ class EntrySignal:
 
     def evaluate(self, asset: str, trend: TrendState, m5_df: pd.DataFrame,
                  atr_history_100: Optional[pd.Series] = None) -> EntryResult:
+        diag = _default_diag()
+
         if trend.status == "NO_TRADE":
-            return EntryResult.hold(asset, "trend NO_TRADE (M15) — short-circuit")
+            return EntryResult.hold(asset, "trend NO_TRADE (M15) — short-circuit", diag)
 
         min_needed = 22  # EMA20 seed(20) + prev candle
         if m5_df is None or len(m5_df) < min_needed:
-            return EntryResult.hold(asset, "M5 ข้อมูลไม่พอ")
+            return EntryResult.hold(asset, "M5 ข้อมูลไม่พอ", diag)
 
         df = IndicatorEngineV2.compute_m5(m5_df)
         row, prev = df.iloc[-1], df.iloc[-2]
         if pd.isna(row.ema20) or pd.isna(row.rsi14) or pd.isna(row.atr14) or pd.isna(row.atr14):
-            return EntryResult.hold(asset, "indicator ยังไม่ settle")
+            return EntryResult.hold(asset, "indicator ยังไม่ settle", diag)
 
         side = "CALL" if trend.status == "UPTREND" else "PUT"
 
@@ -134,30 +147,37 @@ class EntrySignal:
         else:
             pullback_ok = (row.high >= row.ema20 - PULLBACK_TOUCH_ATR_MULT * row.atr14) and \
                           (row.close < row.ema20 + PULLBACK_CLOSE_ATR_MULT * row.atr14)
+        diag["pullback"] = "OK" if pullback_ok else "FAIL"
         if not pullback_ok:
-            return EntryResult.hold(asset, "pullback ไม่เข้าเงื่อนไข")
+            return EntryResult.hold(asset, "pullback ไม่เข้าเงื่อนไข", diag)
 
         # 4.2 Candlestick pattern — logged separately (engulfing vs pinbar)
         pattern = self._detect_pattern(row, prev, side)
+        diag["pattern"] = pattern if pattern is not None else "none"
         if pattern is None:
-            return EntryResult.hold(asset, "ไม่พบแท่งยืนยัน (engulfing/pinbar)")
+            return EntryResult.hold(asset, "ไม่พบแท่งยืนยัน (engulfing/pinbar)", diag)
 
         # 4.3 RSI filter
         lo, hi = RSI_CALL_RANGE if side == "CALL" else RSI_PUT_RANGE
-        if not (lo <= row.rsi14 <= hi):
-            return EntryResult.hold(asset, f"RSI {row.rsi14:.1f} นอกโซน [{lo}-{hi}]")
+        rsi_ok = lo <= row.rsi14 <= hi
+        diag["rsi"] = f"{row.rsi14:.1f}(zone {lo:g}-{hi:g} {'OK' if rsi_ok else 'FAIL'})"
+        if not rsi_ok:
+            return EntryResult.hold(asset, f"RSI {row.rsi14:.1f} นอกโซน [{lo}-{hi}]", diag)
 
         # 4.4 Volatility sanity — median of trailing 100 ATR values (not mean)
         if atr_history_100 is None:
             atr_history_100 = df["atr14"].tail(ATR_HISTORY_WINDOW)
         hist = atr_history_100.dropna()
         if len(hist) < 20:
-            return EntryResult.hold(asset, "ATR history ไม่พอสำหรับ volatility check")
+            diag["vol"] = "FAIL (insufficient history)"
+            return EntryResult.hold(asset, "ATR history ไม่พอสำหรับ volatility check", diag)
         median_atr = float(hist.median())
         if median_atr <= 0:
-            return EntryResult.hold(asset, "median ATR = 0 — ข้อมูลผิดปกติ")
+            diag["vol"] = "FAIL (median ATR = 0)"
+            return EntryResult.hold(asset, "median ATR = 0 — ข้อมูลผิดปกติ", diag)
         vol_ok = (ATR_VOL_LOW_MULT * median_atr) <= row.atr14 <= (ATR_VOL_HIGH_MULT * median_atr)
+        diag["vol"] = "OK" if vol_ok else "FAIL"
         if not vol_ok:
-            return EntryResult.hold(asset, f"ATR {row.atr14:.5f} นอกช่วง {ATR_VOL_LOW_MULT}x-{ATR_VOL_HIGH_MULT}x median100 ({median_atr:.5f})")
+            return EntryResult.hold(asset, f"ATR {row.atr14:.5f} นอกช่วง {ATR_VOL_LOW_MULT}x-{ATR_VOL_HIGH_MULT}x median100 ({median_atr:.5f})", diag)
 
-        return EntryResult.actionable(asset, side, pattern, row, trend)
+        return EntryResult.actionable(asset, side, pattern, row, trend, diag)

@@ -147,7 +147,12 @@ SAFETY_BOUNDS = {
     "expiry_minutes":         ("min", 5),
     "loss_cooldown_minutes":  ("min", 10),
     "max_consecutive_losses": ("max", 5),
-    "daily_loss_limit":       ("max", 300.0),
+    # daily_loss_limit ceiling temporarily raised 300.0 -> 9999.0 per Peet's explicit
+    # instruction (2026-07-13) to stop config.json's 900 from being silently clamped to
+    # 300 while demo-account testing. This is a deliberate, temporary unlock — NOT the
+    # recommended default for live/real-money trading. Lower this back down (e.g. ~300-500)
+    # before switching this bot to a REAL account.
+    "daily_loss_limit":       ("max", 9999.0),
 }
 
 
@@ -497,6 +502,16 @@ class FullTradingBot(TradingBot):
                 continue
             self._sync_state_machine_v1()
             if not self._state_machine_v1 or not self.cfg.assets:
+                # bug-160: this was a completely silent tick — spec_v1 active but the
+                # whole scheduler tick was skipped above state_machine.py, invisible even
+                # with the new [SPEC_V1_SIGNAL] logging (that lives one level down, per
+                # asset, inside on_m5_close()). Log it so a stuck/never-created
+                # BotStateMachine or an empty resolved-assets list is never mistaken for
+                # "evaluating candles but finding no signal".
+                logger.warning(
+                    f"[SPEC_V1_SIGNAL] tick skipped — state_machine_v1={'set' if self._state_machine_v1 else 'None'}, "
+                    f"assets={self.cfg.assets or []}"
+                )
                 continue
             for asset in self.cfg.assets:
                 await self._spec_v1_append_new_candle(asset, "m5")
@@ -546,6 +561,11 @@ class FullTradingBot(TradingBot):
                 continue
             self._sync_state_machine_v1()
             if not self._state_machine_v1 or not self.cfg.assets:
+                # bug-160: same silent-tick gap as spec_v1_m5_loop — see its comment.
+                logger.warning(
+                    f"[SPEC_V1_SIGNAL] M15 tick skipped — state_machine_v1="
+                    f"{'set' if self._state_machine_v1 else 'None'}, assets={self.cfg.assets or []}"
+                )
                 continue
             for asset in self.cfg.assets:
                 await self._spec_v1_append_new_candle(asset, "m15")

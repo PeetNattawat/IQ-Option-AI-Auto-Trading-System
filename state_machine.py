@@ -16,6 +16,7 @@ through `place_order_fn`.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,6 +29,8 @@ from martingale import MartingaleModule
 from risk_manager import RiskManager
 from time_filter import TimeFilter
 from trend_filter import TrendFilter, TrendState
+
+logger = logging.getLogger(__name__)
 
 BANGKOK = ZoneInfo("Asia/Bangkok")
 
@@ -79,6 +82,20 @@ class BotStateMachine:
         self.error_streak = 0
         self.last_ws_pong = time.time()
 
+    def _log_signal(self, asset: str, trend_status: str, decision: str,
+                     diag: Optional[dict] = None):
+        """Unconditional INFO-level breadcrumb — emitted on EVERY on_m5_close() call
+        regardless of outcome (bug-160 diagnostic: prior to this, a HOLD tick left zero
+        trace, making it impossible to tell "evaluated and no signal" apart from
+        "on_m5_close() never actually ran" during live troubleshooting). Tag
+        [SPEC_V1_SIGNAL] so it greps independently of legacy's [SIGNAL] lines."""
+        d = diag or {"pullback": "n/a", "pattern": "n/a", "rsi": "n/a", "vol": "n/a"}
+        logger.info(
+            "[SPEC_V1_SIGNAL] %s | trend=%s | pullback=%s | pattern=%s | rsi=%s | vol=%s | decision=%s",
+            asset, trend_status, d.get("pullback", "n/a"), d.get("pattern", "n/a"),
+            d.get("rsi", "n/a"), d.get("vol", "n/a"), decision,
+        )
+
     def _emit(self, event_type: str, detail: dict):
         if self.on_event:
             try:
@@ -129,11 +146,15 @@ class BotStateMachine:
     def on_m15_close(self, asset: str):
         store = self.candle_stores.get(asset)
         if not store:
+            logger.info("[SPEC_V1_SIGNAL] %s | M15 trend refresh skipped — no candle store", asset)
             return
         self.trend_states[asset] = self.trend_filter.evaluate(store.m15_df(), asset)
+        logger.info("[SPEC_V1_SIGNAL] %s | M15 trend refresh -> %s",
+                    asset, self.trend_states[asset].status)
 
     def on_m5_close(self, asset: str) -> AssetState:
         if self.global_state == "KILLED":
+            self._log_signal(asset, "n/a", "HOLD (bot KILLED — global_state)")
             return self.states[asset]
 
         candle_close_event_time = time.time()
@@ -144,6 +165,7 @@ class BotStateMachine:
         tradeable, reason = self.time_filter.is_tradeable(now_th)
         if not tradeable:
             self._set_asset_state(asset, "IDLE", reason)
+            self._log_signal(asset, "n/a", f"HOLD (not tradeable — {reason})")
             return self.states[asset]
 
         balance = None
@@ -155,11 +177,14 @@ class BotStateMachine:
         can, reason = self.risk_manager.can_trade(now_th, balance)
         if not can:
             self._set_asset_state(asset, "IDLE", reason)
+            self._log_signal(asset, "n/a", f"HOLD (risk gate — {reason})")
             return self.states[asset]
 
         trend = self.trend_states.get(asset)
         if trend is None or trend.status == "NO_TRADE":
             self._set_asset_state(asset, "IDLE", "NO_TRADE (M15)")
+            self._log_signal(asset, trend.status if trend else "n/a (no M15 trend yet)",
+                              "HOLD (trend NO_TRADE / not yet computed)")
             return self.states[asset]
 
         # ── CHECK_SIGNAL ──
@@ -167,11 +192,15 @@ class BotStateMachine:
         store = self.candle_stores.get(asset)
         if not store:
             self._set_asset_state(asset, "IDLE", "no candle store")
+            self._log_signal(asset, trend.status, "HOLD (no candle store)")
             return self.states[asset]
         result = self.entry_signal.evaluate(asset, trend, store.m5_df())
         if result.signal == "HOLD":
             self._set_asset_state(asset, "IDLE", result.reason)
+            self._log_signal(asset, trend.status, f"HOLD ({result.reason})", result.diag)
             return self.states[asset]
+
+        self._log_signal(asset, trend.status, f"ENTER {result.signal} ({result.pattern})", result.diag)
 
         # ── PLACE_ORDER ──
         self._set_asset_state(asset, "PLACE_ORDER")
