@@ -537,6 +537,15 @@ class FullTradingBot(TradingBot):
                     f"assets={self.cfg.assets or []}"
                 )
                 continue
+            # bug-181: _ensure_candle_stores() was previously ONLY wired into the legacy
+            # scan cycle (run_cycle(), line ~678) and startup (main_loop(), line ~1361).
+            # spec_v1 must not depend on the legacy loop's side effect to seed its own
+            # candle stores (e.g. if run_cycle() ever returns early — paused, weekend
+            # halt, reconnecting — before reaching line 678, spec_v1's stores never get
+            # created/refreshed even though its own scheduler keeps ticking). Seed here,
+            # every tick, before the per-asset loop — idempotent (skips assets that
+            # already have a store, §4.1), so this is safe to call unconditionally.
+            self._ensure_candle_stores()
             for asset in self.cfg.assets:
                 await self._spec_v1_append_new_candle(asset, "m5")
                 # §2 site 3/3 (bug-155 fix): the `await` above is a real asyncio interleave
@@ -591,6 +600,9 @@ class FullTradingBot(TradingBot):
                     f"{'set' if self._state_machine_v1 else 'None'}, assets={self.cfg.assets or []}"
                 )
                 continue
+            # bug-181: mirror spec_v1_m5_loop's seeding — do NOT rely on the M5 loop
+            # having ticked first (idempotent, shares the same self._candle_stores dict).
+            self._ensure_candle_stores()
             for asset in self.cfg.assets:
                 await self._spec_v1_append_new_candle(asset, "m15")
                 # §2 site 3/3 (bug-155 fix): same interleave hazard as spec_v1_m5_loop — recheck
