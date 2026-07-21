@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS trades (
     balance_after     REAL,
     source            TEXT NOT NULL,
     martingale_step   INTEGER,
-    state_trace       TEXT
+    state_trace       TEXT,
+    session           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS system_events (
@@ -71,7 +72,15 @@ TRADE_COLUMNS = [
     "order_id", "timestamp", "pair", "direction", "stake", "entry_price", "expiry_price",
     "result", "pnl", "ema20_m15", "ema50_m15", "ema20_m5", "rsi_m5", "atr_m5",
     "pattern_type", "trend_status", "latency_ms", "balance_before", "balance_after",
-    "source", "martingale_step", "state_trace",
+    "source", "martingale_step", "state_trace", "session",
+]
+
+# Columns added after the table already shipped to a live DB (data/trades.db) — CREATE
+# TABLE IF NOT EXISTS alone will NOT add these to a pre-existing file, so __init__ runs an
+# idempotent ALTER TABLE migration for each one (2026-07-21: `session` for the 24h
+# trading-hours experiment win-rate-by-session comparison).
+_MIGRATIONS = [
+    ("trades", "session", "TEXT"),
 ]
 
 
@@ -82,6 +91,20 @@ class TradeLogger:
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            self._run_migrations(conn)
+
+    def _run_migrations(self, conn: sqlite3.Connection):
+        """Idempotent ALTER TABLE ADD COLUMN for every entry in _MIGRATIONS — safe to run on
+        every startup. Rollback plan: additive-only (never drops/renames a column), so a
+        migration here is never destructive; if a column needs to be removed in the future
+        that would need an explicit separate rollback migration, not a revert of this one."""
+        for table, column, coltype in _MIGRATIONS:
+            try:
+                cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if column not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+            except sqlite3.OperationalError:
+                pass  # column already exists (race with another process) or table missing
 
     @contextmanager
     def _conn(self):

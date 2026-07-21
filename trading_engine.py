@@ -151,6 +151,17 @@ class TradingConfig:
     martingale_ack_risk: bool = False     # NEW — must be True in the SAME payload as
                                            # martingale_enabled=True to actually enable it (ADR-4)
 
+    # ── 2026-07-21 24h PRACTICE-only trading-hours experiment (Psycho-approved) ──
+    # Default False = current real-money-safe two-window behavior, byte-for-byte unchanged.
+    # When True, TimeFilter.is_tradeable() bypasses ONLY the 14:00-17:00/19:30-22:30 window
+    # check (weekend halt / Monday gate / NY-open blackout are unaffected — see
+    # time_filter.py's module docstring for the full design note). Guarded by
+    # main.py's _enforce_trading_hours_experiment_practice_gate(): can only be True while
+    # account_type == "PRACTICE" — refuses/forces back to False otherwise (mirrors the
+    # existing spec_v1 practice-only gate). spec_v1-only; legacy's separate learning/ADX
+    # engine does not consult this flag.
+    trading_hours_experiment: bool = False
+
     def __post_init__(self):
         if self.enabled_pairs is None:
             self.enabled_pairs = [self.default_pair]

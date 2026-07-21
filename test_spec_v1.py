@@ -467,6 +467,84 @@ def test_time_filter_weekend():
     check("time_filter: Saturday -> not tradeable", not ok and "สุดสัปดาห์" in reason, reason)
 
 
+# ─────────────────────────────────────────
+# 9. TimeFilter — 2026-07-21 24h PRACTICE-only trading-hours experiment flag
+# ─────────────────────────────────────────
+def test_time_filter_experiment_flag_inert_when_unset():
+    """Default (flag unset / False) must be byte-for-byte identical to pre-experiment
+    behavior — this is the real-money safety guarantee the ticket asked to prove."""
+    tf_default = TimeFilter()
+    tf_explicit_false = TimeFilter(trading_hours_experiment=False)
+    probe_times = [
+        datetime(2026, 7, 9, 15, 0, tzinfo=BANGKOK),   # in window 1
+        datetime(2026, 7, 9, 18, 0, tzinfo=BANGKOK),   # outside all windows
+        datetime(2026, 7, 9, 19, 15, tzinfo=BANGKOK),  # NY-open blackout
+        datetime(2026, 7, 9, 20, 0, tzinfo=BANGKOK),   # in window 2
+        datetime(2026, 7, 10, 21, 30, tzinfo=BANGKOK), # Friday after 21:00
+        datetime(2026, 7, 13, 14, 30, tzinfo=BANGKOK), # Monday before 15:00
+        datetime(2026, 7, 11, 15, 0, tzinfo=BANGKOK),  # Saturday
+    ]
+    all_match = True
+    for probe in probe_times:
+        r1 = tf_default.is_tradeable(probe)
+        r2 = tf_explicit_false.is_tradeable(probe)
+        if r1 != r2:
+            all_match = False
+    check("time_filter: trading_hours_experiment unset/False is inert (identical to pre-experiment "
+          "TimeFilter() across all probed times)", all_match)
+
+
+def test_time_filter_experiment_flag_bypasses_windows():
+    tf = TimeFilter(trading_hours_experiment=True)
+    ok, reason = tf.is_tradeable(datetime(2026, 7, 9, 18, 0, tzinfo=BANGKOK))  # Thu 18:00 — normally outside all windows
+    check("time_filter: experiment flag makes 18:00 Thu (outside normal windows) tradeable",
+          ok and "experiment" in reason, reason)
+    ok2, reason2 = tf.is_tradeable(datetime(2026, 7, 9, 2, 0, tzinfo=BANGKOK))  # 02:00 — deep off-hours
+    check("time_filter: experiment flag makes 02:00 Thu (deep off-hours) tradeable",
+          ok2 and "experiment" in reason2, reason2)
+
+
+def test_time_filter_experiment_flag_weekend_halt_still_fires():
+    """Psycho was explicit: weekend gaps must NOT be included in the experiment's data —
+    the experiment flag must never bypass the weekend halt / Monday gate."""
+    tf = TimeFilter(trading_hours_experiment=True)
+    ok, reason = tf.is_tradeable(datetime(2026, 7, 11, 15, 0, tzinfo=BANGKOK))  # Saturday
+    check("time_filter: experiment flag does NOT bypass Saturday weekend halt",
+          not ok and "สุดสัปดาห์" in reason, reason)
+    ok2, reason2 = tf.is_tradeable(datetime(2026, 7, 12, 15, 0, tzinfo=BANGKOK))  # Sunday
+    check("time_filter: experiment flag does NOT bypass Sunday weekend halt",
+          not ok2 and "สุดสัปดาห์" in reason2, reason2)
+    ok3, reason3 = tf.is_tradeable(datetime(2026, 7, 10, 21, 30, tzinfo=BANGKOK))  # Fri after 21:00
+    check("time_filter: experiment flag does NOT bypass Friday-after-21:00 halt",
+          not ok3 and "ศุกร์" in reason3, reason3)
+    ok4, reason4 = tf.is_tradeable(datetime(2026, 7, 13, 14, 30, tzinfo=BANGKOK))  # Monday before 15:00
+    check("time_filter: experiment flag does NOT bypass Monday-before-15:00 gate "
+          "(design decision — see time_filter.py module docstring)",
+          not ok4 and "จันทร์" in reason4, reason4)
+
+
+def test_time_filter_experiment_flag_ny_blackout_still_fires():
+    """Design decision (Titan, 2026-07-21): the 19:00-19:30 NY-open blackout stays a normal
+    always-on gate under the experiment flag too — see time_filter.py module docstring."""
+    tf = TimeFilter(trading_hours_experiment=True)
+    ok, reason = tf.is_tradeable(datetime(2026, 7, 9, 19, 15, tzinfo=BANGKOK))
+    check("time_filter: experiment flag does NOT bypass the 19:00-19:30 NY-open blackout",
+          not ok and "blackout" in reason, reason)
+
+
+def test_time_filter_session_tag():
+    tf = TimeFilter()
+    tag1 = tf.session_tag(datetime(2026, 7, 9, 15, 0, tzinfo=BANGKOK))   # in window 1
+    check("time_filter: session_tag() labels in-window ticks 'london_ny_window'",
+          tag1 == "london_ny_window", tag1)
+    tag2 = tf.session_tag(datetime(2026, 7, 9, 20, 0, tzinfo=BANGKOK))   # in window 2
+    check("time_filter: session_tag() labels window-2 ticks 'london_ny_window' too",
+          tag2 == "london_ny_window", tag2)
+    tag3 = tf.session_tag(datetime(2026, 7, 9, 2, 0, tzinfo=BANGKOK))    # off-hours
+    check("time_filter: session_tag() labels off-hours ticks 'experiment_extended_hours'",
+          tag3 == "experiment_extended_hours", tag3)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in list(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

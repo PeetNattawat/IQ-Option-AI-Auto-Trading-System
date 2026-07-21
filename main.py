@@ -124,6 +124,44 @@ def _enforce_spec_v1_practice_gate(cfg: TradingConfig, tg: "TelegramBot | None" 
     return False
 
 
+def _enforce_trading_hours_experiment_practice_gate(
+    cfg: TradingConfig, tg: "TelegramBot | None" = None,
+    trade_logger: "TradeLogger | None" = None,
+) -> bool:
+    """Hard safety gate (2026-07-21, Psycho-approved 24h PRACTICE experiment) — mirrors
+    _enforce_spec_v1_practice_gate() exactly, same defense-in-depth call sites (apply_runtime_config,
+    switch_account, and the spec_v1 M5/M15 scheduler loop itself). If trading_hours_experiment
+    is ever True while account_type != PRACTICE, force it back to False — this experiment must
+    NEVER run on a real-money account. Never crashes, never silently passes through.
+    Returns True if a forced fallback just happened (caller may want to alert)."""
+    if cfg.trading_hours_experiment and cfg.account_type != "PRACTICE":
+        logger.warning(
+            f"[SAFETY-GATE] trading_hours_experiment=True blocked on account_type={cfg.account_type} "
+            "— the 24h trading-hours experiment is PRACTICE-only (Psycho/Peet-approved 2026-07-21). "
+            "Forcing trading_hours_experiment back to False."
+        )
+        cfg.trading_hours_experiment = False
+        if trade_logger is not None:
+            try:
+                ts = datetime.now(ZoneInfo("Asia/Bangkok")).isoformat()
+                trade_logger.write_system_event(ts, "SAFETY_GATE_TRIPPED", {
+                    "account_type": cfg.account_type,
+                    "forced_trading_hours_experiment": False,
+                })
+            except Exception as e:
+                logger.warning(f"[SAFETY-GATE] write_system_event failed: {e}")
+        if tg is not None:
+            try:
+                asyncio.create_task(tg.send(
+                    "⚠️ <b>SAFETY GATE</b>\n\n"
+                    "พยายามเปิด trading_hours_experiment บนบัญชีที่ไม่ใช่ PRACTICE — ระบบบังคับปิดอัตโนมัติ"
+                ))
+            except RuntimeError:
+                pass  # no running event loop — log above still fired
+        return True
+    return False
+
+
 def load_runtime_config() -> dict:
     try:
         with open(RUNTIME_CONFIG_PATH) as f:
@@ -148,6 +186,8 @@ RUNTIME_FIELDS = [
     "strategy_mode", "stake_pct", "weekly_loss_limit_pct", "daily_loss_limit_pct",
     "signal_cooldown_minutes", "auto_stop_enabled", "auto_stop_drawdown_pct",
     "martingale_ack_risk", "enabled_pairs", "default_pair",
+    # ── 24h PRACTICE-only trading-hours experiment (2026-07-21, Psycho-approved) ──
+    "trading_hours_experiment",
 ]
 
 
@@ -239,6 +279,9 @@ def apply_runtime_config(cfg: TradingConfig, rt: dict, tg: "TelegramBot | None" 
     # spec_v1 PRACTICE-only hard safety gate (§2, call site 1/3) — runs on every apply,
     # covering both the startup load and every dashboard update_settings edit.
     _enforce_spec_v1_practice_gate(cfg, tg, trade_logger)
+    # 24h trading-hours experiment PRACTICE-only hard safety gate (call site 1/3) — same
+    # coverage as above.
+    _enforce_trading_hours_experiment_practice_gate(cfg, tg, trade_logger)
 
 
 # ─────────────────────────────────────────────────
@@ -271,7 +314,11 @@ class FullTradingBot(TradingBot):
         self._candle_stores: dict[str, CandleStore] = {}    # §4.1 one CandleStore per resolved asset
         self._trend_filter_v1 = TrendFilter()
         self._entry_signal_v1 = EntrySignal()
-        self._time_filter_v1 = TimeFilter()
+        # trading_hours_experiment seeded from cfg at construction time — apply_runtime_config()
+        # (config.json load) already ran before FullTradingBot.__init__ in main(), so cfg already
+        # reflects the persisted flag here. Re-synced on every later edit — see
+        # _sync_time_filter_v1_config().
+        self._time_filter_v1 = TimeFilter(trading_hours_experiment=cfg.trading_hours_experiment)
         self._state_machine_v1: BotStateMachine | None = None
         self._spec_v1_was_active = False   # edge-trigger flag for _sync_state_machine_v1 (§8)
 
@@ -285,6 +332,15 @@ class FullTradingBot(TradingBot):
         every apply_runtime_config(self.cfg, ...) call that happens post-__init__."""
         for f in RISK_V2_SYNC_FIELDS:
             setattr(self._risk_v2.cfg, f, getattr(self.cfg, f))
+
+    def _sync_time_filter_v1_config(self):
+        """Re-mirror trading_hours_experiment from self.cfg onto self._time_filter_v1.
+        self._time_filter_v1 is a SEPARATE TimeFilter instance built once in __init__ (seeded
+        from cfg at construction time) — without this explicit re-sync a later config
+        reload/dashboard edit would silently leave the live TimeFilter running on a stale flag
+        value. Cheap (single attribute set) — safe to call unconditionally on every scheduler
+        tick as well as after every apply_runtime_config() call."""
+        self._time_filter_v1.trading_hours_experiment = self.cfg.trading_hours_experiment
 
     def log_activity(self, icon: str, msg: str, phase: str = "", level: str = "info"):
         """Record what the bot is doing → shown live on the dashboard 'กิจกรรมบอท' feed.
@@ -442,7 +498,14 @@ class FullTradingBot(TradingBot):
         same CandleStore the state machine just evaluated — no state_machine.py contract
         change needed) so §6's SQLite schema (ema20_m15/ema50_m15/ema20_m5/rsi_m5/atr_m5)
         is populated without re-deriving state_machine's internal decision path."""
-        meta = {"source": "spec_v1", "confidence": None, "balance_before": state_store.get("balance")}
+        # session: which time-window bucket this ENTER fell into (2026-07-21 24h experiment
+        # ticket) — lets Peet/Psycho later compare win rate by session and see whether
+        # off-hours (experiment_extended_hours) trades are consuming the max_trades_per_day
+        # budget before the core london_ny_window sessions arrive ("budget cannibalization").
+        meta = {
+            "source": "spec_v1", "confidence": None, "balance_before": state_store.get("balance"),
+            "session": self._time_filter_v1.session_tag(),
+        }
         trend = self._state_machine_v1.trend_states.get(asset) if self._state_machine_v1 else None
         if trend is not None:
             meta["ema20_m15"] = trend.ema20
@@ -485,6 +548,7 @@ class FullTradingBot(TradingBot):
                 "balance_before": t.get("balance_before"),
                 "balance_after": state_store.get("balance"),
                 "source": t.get("source"),
+                "session": t.get("session"),  # 2026-07-21 24h experiment: london_ny_window | experiment_extended_hours
                 "martingale_step": None,   # spec_v1 does not use Martingale (§4.3)
                 "state_trace": None,
             })
@@ -524,6 +588,10 @@ class FullTradingBot(TradingBot):
                 continue
             if _enforce_spec_v1_practice_gate(self.cfg, self.tg, self._trade_logger):  # §2 site 3/3
                 continue
+            # 24h trading-hours experiment gate (call site 3/3) + mirror the live flag onto the
+            # shared TimeFilter instance every tick, so a dashboard edit takes effect immediately.
+            _enforce_trading_hours_experiment_practice_gate(self.cfg, self.tg, self._trade_logger)
+            self._sync_time_filter_v1_config()
             self._sync_state_machine_v1()
             if not self._state_machine_v1 or not self.cfg.assets:
                 # bug-160: this was a completely silent tick — spec_v1 active but the
@@ -592,6 +660,10 @@ class FullTradingBot(TradingBot):
                 continue
             if _enforce_spec_v1_practice_gate(self.cfg, self.tg, self._trade_logger):  # §2 site 3/3
                 continue
+            # 24h trading-hours experiment gate (call site 3/3) + mirror the live flag onto the
+            # shared TimeFilter instance every tick — see spec_v1_m5_loop's identical comment.
+            _enforce_trading_hours_experiment_practice_gate(self.cfg, self.tg, self._trade_logger)
+            self._sync_time_filter_v1_config()
             self._sync_state_machine_v1()
             if not self._state_machine_v1 or not self.cfg.assets:
                 # bug-160: same silent-tick gap as spec_v1_m5_loop — see its comment.
@@ -960,6 +1032,11 @@ class FullTradingBot(TradingBot):
             if _enforce_spec_v1_practice_gate(self.cfg, self.tg, self._trade_logger):
                 save_runtime_config(self.cfg)
                 await self._push_settings()
+            # 24h trading-hours experiment PRACTICE-only gate (call site 2/3) — switch_account
+            # previously had no check for this flag at all; mirrors the spec_v1 gate above.
+            if _enforce_trading_hours_experiment_practice_gate(self.cfg, self.tg, self._trade_logger):
+                save_runtime_config(self.cfg)
+                await self._push_settings()
             try:
                 self.iq.change_balance(account)
                 state_store["account_type"] = account
@@ -999,6 +1076,7 @@ class FullTradingBot(TradingBot):
                 settings["max_open_positions"] = 1  # always 1: global single Martingale ladder
             apply_runtime_config(self.cfg, settings, self.tg, self._trade_logger)
             self._sync_risk_v2_config()  # bug-16x: keep risk_v2's RiskConfig mirrored after every edit
+            self._sync_time_filter_v1_config()  # keep the live TimeFilter's experiment flag mirrored too
             save_runtime_config(self.cfg)
             logger.info(f"[CMD] Settings updated: {', '.join(settings.keys())}")
             await self._push_settings()
